@@ -744,19 +744,19 @@ script.
 
  #  Objective            Test (command / file)        Expected outcome                               Stated limit
  -- -------------------- ---------------------------- ---------------------------------------------- ------------------------------
- 1  Key rotation         [test_rotation]              Transfers succeed during rotation; old key     Grace period = [value]
-                                                      rejected on all nodes after cutoff
- 2  Revocation + device  [test_revocation,            Revoked key rejected by every node; time to    Propagation window = [value];
-    loss                  test_device_loss]            last node reported; re-enrol works; others     fail-closed on stale state
-                                                      keep access
- 3  Crash recovery       [test_crash_recovery]        Consistent authorised version after crash at   Covers injected crash points
-                                                      every step; revocations persist                listed in section 10
- 4  Backup integrity     [test_backup_integrity]      Damaged backup detected and reported; only     Detects corruption; does not
+ 1  Key rotation         tests/test_node_authorize.py Transfers succeed during rotation; old key     Grace period = none (0 epochs
+                                                      rejected on all nodes after cutoff             after cutoff)
+ 2  Revocation + device  tests/test_harness.py        Revoked key rejected by every node; time to    Freshness window = None (default)
+    loss                 tests/test_node_authorize.py last node reported; re-enrol works; others     or 30s (harness); fail-closed on
+                                                      keep access                                    stale state
+ 3  Crash recovery       tests/test_crash_recovery.py Consistent authorised version after crash at   Covers all 8 WAL/apply crash
+                                                      every step; revocations persist                points in section 10
+ 4  Backup integrity     tests/test_backup_integrity.py Damaged backup detected and reported; only   Detects corruption; does not
                                                       verified material used                         restore lost data by itself
- 5  Log integrity        [test_log_integrity]         Injection cannot fake events or actor; chain   Assumes external head hash
+ 5  Log integrity        tests/test_log_integrity.py  Injection cannot fake events or actor; chain   Assumes external head hash
                                                       verifies; tampering detected                   location is not also rewritten
- 6  Routine vs           [eval_detection]             F1, median time to alert, false alerts per     Measured on [dataset]
-    suspicious                                         1,000 benign events reported
+ 6  Routine vs           tests/test_detection_eval.py F1, median time to alert, false alerts per     Measured on deterministic 1,020-
+    suspicious                                        1,000 benign events reported                   event dataset (seed=42)
  7  Lateral movement     [test_lateral_movement]      Unusual path flagged with identity, services,  Depends on a correct allowed-edge
                                                       events and rule/path                           graph
  8  Clock differences    [test_clock_skew]            In-range skew/reorder handled; out-of-range    Supported range +/-[N]s,
