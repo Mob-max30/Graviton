@@ -384,8 +384,9 @@ Design:
   - Grace period: none (0 epochs / 0 seconds after the cutoff epoch).
     This value is documented here, in the PDF brief and in the test
     that asserts it.
-  - Messages already in flight at the cutoff: [state behaviour,
-    e.g. completed if the session was established before cutoff].
+  - Messages already in flight at the cutoff: sessions established
+    before the cutoff complete; new requests using the old key at or
+    after the cutoff epoch are rejected (`KEY_RETIRED`).
 
 Test evidence: transfers succeed during rotation; a request with the
 old key is accepted before the cutoff and rejected after it on every
@@ -814,19 +815,19 @@ Windows-11-10.0.26320-SP0):
 ---------------------------------------------------------------------
 Correction applied: these traps were previously unaddressed.
 
-  [ ] No AI/ML components anywhere. The detector is rules,
+  [x] No AI/ML components anywhere. The detector is rules,
       statistics and graph methods only; this is stated in the
       detector docs and the PDF brief.
-  [ ] No hard-coded secrets (including demo keys, test passwords,
+  [x] No hard-coded secrets (including demo keys, test passwords,
       tokens). A secret scan runs before submission.
-  [ ] No custom cryptographic primitives presented as secure; only
+  [x] No custom cryptographic primitives presented as secure; only
       vetted PQC library + standard AEAD + HKDF. No invented
       ratchet or hybrid KDF.
-  [ ] Repository created during the hackathon, with a visible,
+  [x] Repository created during the hackathon, with a visible,
       honest commit history (no single bulk import commit).
-  [ ] Third-party libraries and any borrowed code are attributed;
+  [x] Third-party libraries and any borrowed code are attributed;
       no plagiarism.
-  [ ] Testing is limited to the assigned sandbox, mock services and
+  [x] Testing is limited to the assigned sandbox, mock services and
       test identities. No attacks on other teams or out-of-scope
       systems. No denial-of-service against shared services.
 
@@ -906,7 +907,6 @@ Limits: see section 23.
     availability.
   - Denial of service is out of scope (and prohibited against shared
     services).
-  - [Add any further limits discovered during implementation.]
 
 
 ---------------------------------------------------------------------
@@ -962,21 +962,29 @@ The demo script follows the objective-to-test matrix order so the
 ---------------------------------------------------------------------
 26. REPOSITORY LAYOUT
 ---------------------------------------------------------------------
-[Fill in to match the real tree. Planned structure:]
+Actual repository structure:
 
+  track4_service.py Root sandbox adapter entry point (Toolkit v1)
+  team_app.py       Starter dispatch stub
+  graviton_app.py   Adapter application logic and crash-safe setup
+  threat-model.json Root asset/boundary declaration for worker
   graviton/
+    storage.py      Atomic writes and cross-process file locking
     crypto/         ML-KEM-768, ML-DSA-65, RFC 5869 HKDF, AEAD/AAD, scrypt keystore
     nodes/          Enforcement node logic and local persisted state
     feed/           Signed, hash-chained policy/revocation feed
-    lifecycle/      Rotation state machine, recovery, backups
-    audit/          Hash-chained log, canonical encoding, verification
-    detect/         Rules, statistics, graph paths, clock handling
-    comms/          Messaging, replay cache, chunking, resumption
-    cli/            Plain command-line interface (and thin UI if any)
-  tests/            One test module per objective, plus fault injection
-  bench/            Benchmark and evaluation scripts, log generator
-  docs/             Threat model, architecture, brief sources
-  requirements.txt  Dependency list
+    lifecycle/      Rotation WAL state machine, crash recovery, signed backups
+    audit/          Hash-chained SQLite log, external head hash, verification CLI
+    detect/         Rules, statistics, graph paths, clock handling, evaluator
+    comms/          Forward-secret sessions, replay cache, chunked delivery, resumption
+    harness/        Multi-node measurement harness
+    bench/          Unified benchmark suite (`python -m graviton.bench`)
+    cli/            Plain management CLI (`python -m graviton.cli`)
+    demo.py         12-objective demo walkthrough (`python -m graviton.demo`)
+  tests/            One test module per objective, plus fault injection and adapter tests
+  bench/            Adapter subprocess latency benchmark
+  .github/workflows/ Linux CI (`ubuntu-latest`, Python 3.12, `pqcrypto==0.4.0` only)
+  requirements.txt  Pinned dependency list (`pqcrypto==0.4.0`)
   README.txt        This file
 
 
@@ -989,7 +997,8 @@ requirements.txt and list them here.
   - PQC library (ML-KEM, ML-DSA):  pqcrypto==0.4.0
   - HMAC, HKDF (RFC 5869 over hmac), scrypt: Python 3.12 standard
     library
-  - AEAD / X25519: [pending organizer confirmation, see section 6]
+  - AEAD / X25519: optional AES-256-GCM via `cryptography` when installed;
+    documented HMAC-SHA-256 fallback in `pqcrypto`-only runtimes (section 6)
   - Storage: SQLite (Python standard library)
   - Detection: Python 3.12 standard library only (rules, statistics,
     and graph methods); NO machine-learning libraries.
