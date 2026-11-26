@@ -782,7 +782,7 @@ Correction applied: previously nothing was measured. Performance is 10
 points and "verifiable outcomes" is part of Functionality, so a single
 script prints all required figures.
 
-Command: [e.g. `python -m graviton.bench`]
+Command: `python -m graviton.bench --iterations 20 --out bench_results.json`
 
 Outputs:
   - Detection: F1, median time to alert, false alerts per 1,000
@@ -796,7 +796,17 @@ Outputs:
 
 Results are written to a machine-readable file and a human-readable
 summary. Hardware and library versions are printed with every run so
-numbers are reproducible. Measured values: [fill in from actual runs].
+numbers are reproducible. Measured values (Python 3.12.13, pqcrypto 0.4.0,
+Windows-11-10.0.26320-SP0):
+  - Detection : F1 = 1.0, median_tta = 385.0 ms, false_alerts/1k = 0.0
+  - Revocation: nodes = 5, delay_ms = [0, 50], last_node_ms = 110.0,
+                max_compute_ms = 78.0
+  - Rotation  : pre_v1_allow = True, post_v2_allow = True,
+                catchup_ms = 47.0
+  - Messaging : session_setup_median = 4.685 ms,
+                encrypt_median = 0.858 ms, decrypt_median = 0.051 ms
+  - Overhead  : log_append_median = 16.612 ms, verify_50_events = 17.224 ms,
+                storage_50_events = 20585 B
 
 
 ---------------------------------------------------------------------
@@ -937,11 +947,10 @@ listed above. This is a common failure point.
   - Run Phase 1 adapter tests:      python -m unittest discover -s tests -v
   - Run Toolkit validator (from Toolkit directory):
                                     python validate.py --entry "../Graviton/track4_service.py"
-  - Run all objective tests:        [command]
-  - Run a single objective test:    [command, see section 19]
-  - Run the benchmark/evaluation:   [command, see section 20]
-  - Run the demo walkthrough:       [command or script mirroring the
-                                      section 19 matrix]
+  - Run all objective tests:        python -m unittest discover -s tests -v
+  - Run a single objective test:    python -m unittest tests/<module>.py -v (see section 19)
+  - Run the benchmark/evaluation:   python -m graviton.bench --iterations 20
+  - Run the demo walkthrough:       python -m graviton.demo
   - Fault-injection suite:          python -m unittest tests/test_crash_recovery.py -v
   - Log verification:               python -m graviton.audit verify --db <db> --head <head.json>
   - Backup verification:            python -m unittest tests/test_backup_integrity.py -v
@@ -982,9 +991,9 @@ requirements.txt and list them here.
     library
   - AEAD / X25519: [pending organizer confirmation, see section 6]
   - Storage: SQLite (Python standard library)
-  - Detection: standard library and [any statistics/graph library,
-    documented]; NO machine-learning libraries.
-  - Test tooling: [name, version]
+  - Detection: Python 3.12 standard library only (rules, statistics,
+    and graph methods); NO machine-learning libraries.
+  - Test tooling: unittest (Python 3.12 standard library)
 
 
 ---------------------------------------------------------------------
