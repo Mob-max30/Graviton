@@ -102,12 +102,16 @@ class Cluster:
                 auth = node.authorize(*verify_actor)
                 decision = auth.decision
                 reason = auth.reason.value
-            enforced_ns = time.monotonic_ns() - t0
+            c2 = time.monotonic_ns()
+            enforced_ns = c2 - t0
             return {
                 "node": f"node_{idx}",
                 "status": apply_res.status,
                 "enforced_ms": round(enforced_ns / 1_000_000, 3),
-                "compute_ms": round((c1 - c0) / 1_000_000, 3),
+                "delay_actual_ms": round((c0 - t0) / 1_000_000, 3),
+                "apply_ms": round((c1 - c0) / 1_000_000, 3),
+                "authorize_ms": round((c2 - c1) / 1_000_000, 3),
+                "compute_ms": round((c2 - c0) / 1_000_000, 3),
                 "decision": decision,
                 "reason": reason,
             }

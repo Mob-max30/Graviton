@@ -30,6 +30,7 @@ REQUEST_SIGN_DOMAIN = b"request"
 class ReasonCode(str, Enum):
     OK = "OK"
     UNKNOWN_KEY = "UNKNOWN_KEY"
+    INVALID_SIGNATURE = "INVALID_SIGNATURE"
     REVOKED_DEVICE = "REVOKED_DEVICE"
     REVOKED_ACTOR = "REVOKED_ACTOR"
     KEY_RETIRED = "KEY_RETIRED"
@@ -161,8 +162,6 @@ def _apply_semantic_transition(
     if entry.entry_type == EntryType.REVOKE_ACTOR:
         actor = entry.actor
         assert actor is not None
-        if actor not in registry:
-            raise _SemanticError("Actor does not exist")
         if actor not in revoked_actors:
             revoked_actors.append(actor)
         return
@@ -439,7 +438,7 @@ class Node:
     ) -> Decision:
         """Verify ML-DSA-65 device signature (domain 'request') then authorize."""
         if not isinstance(payload, (bytes, bytearray)) or not isinstance(signature, (bytes, bytearray)):
-            return Decision("deny", ReasonCode.UNKNOWN_KEY)
+            return Decision("deny", ReasonCode.INVALID_SIGNATURE)
 
         with _state_lock(self.state_dir):
             try:
@@ -460,9 +459,9 @@ class Node:
                     state["feed_id"], actor, device_id, key_version, bytes(payload)
                 )
             except FeedFormatError:
-                return Decision("deny", ReasonCode.UNKNOWN_KEY)
+                return Decision("deny", ReasonCode.INVALID_SIGNATURE)
 
             if not verify_signature(pub_key, signed_bytes, bytes(signature), domain=REQUEST_SIGN_DOMAIN):
-                return Decision("deny", ReasonCode.UNKNOWN_KEY)
+                return Decision("deny", ReasonCode.INVALID_SIGNATURE)
 
             return Decision("allow", ReasonCode.OK)

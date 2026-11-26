@@ -1,0 +1,47 @@
+name: Graviton CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+jobs:
+  linux-pqcrypto-only:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Graviton
+        uses: actions/checkout@v4
+        with:
+          path: Graviton
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install only requirements.txt (pqcrypto==0.4.0)
+        working-directory: Graviton
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Verify imports without cryptography
+        working-directory: Graviton
+        run: |
+          python -c "import graviton, graviton.crypto, graviton.feed, graviton.nodes, graviton.harness, track4_service"
+
+      - name: Run full unittest suite (exercises fcntl.flock & POSIX modes)
+        working-directory: Graviton
+        run: |
+          python -m unittest discover -s tests -v
+
+      - name: Clone Track-4-Toolkit and run validate.py
+        run: |
+          git clone --depth 1 https://github.com/ScalerOpenSourceLabs/Track-4-Toolkit Track-4-Toolkit
+          cd Track-4-Toolkit
+          python validate.py --entry "../Graviton/track4_service.py"
+
+      - name: Run Phase 3 multi-node harness on Linux
+        working-directory: Graviton
+        run: |
+          python -m graviton.harness --scenario all --nodes 5 --delay-ms 0:50 --seed 1

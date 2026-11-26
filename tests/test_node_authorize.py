@@ -130,19 +130,30 @@ class TestNodeAuthorize(unittest.TestCase):
         sig_v1 = sign_message(sk1, msg_v1, domain=b"request")
         self.assertEqual(node.authenticate_request("alice", "dev-1", 1, payload, sig_v1).decision, "allow")
 
-        # Wrong version, wrong key, tampered payload, tampered actor, wrong domain
-        self.assertEqual(node.authenticate_request("alice", "dev-1", 2, payload, sig_v1).decision, "deny")
+        # Wrong version (v2 is known, sig is from v1), wrong key, tampered payload, wrong domain -> INVALID_SIGNATURE; unknown actor -> UNKNOWN_KEY
+        self.assertEqual(node.authenticate_request("alice", "dev-1", 2, payload, sig_v1).reason, ReasonCode.INVALID_SIGNATURE)
         sig_wrong = sign_message(wrong_sk, msg_v1, domain=b"request")
-        self.assertEqual(node.authenticate_request("alice", "dev-1", 1, payload, sig_wrong).decision, "deny")
-        self.assertEqual(node.authenticate_request("alice", "dev-1", 1, payload + b"!", sig_v1).decision, "deny")
-        self.assertEqual(node.authenticate_request("bob", "dev-1", 1, payload, sig_v1).decision, "deny")
+        self.assertEqual(node.authenticate_request("alice", "dev-1", 1, payload, sig_wrong).reason, ReasonCode.INVALID_SIGNATURE)
+        self.assertEqual(node.authenticate_request("alice", "dev-1", 1, payload + b"!", sig_v1).reason, ReasonCode.INVALID_SIGNATURE)
+        self.assertEqual(node.authenticate_request("bob", "dev-1", 1, payload, sig_v1).reason, ReasonCode.UNKNOWN_KEY)
 
         sig_feed_domain = sign_message(sk1, msg_v1, domain=FEED_SIGN_DOMAIN)
-        self.assertEqual(node.authenticate_request("alice", "dev-1", 1, payload, sig_feed_domain).decision, "deny")
+        self.assertEqual(node.authenticate_request("alice", "dev-1", 1, payload, sig_feed_domain).reason, ReasonCode.INVALID_SIGNATURE)
 
         # Revoked device denied even with valid signature
         node.apply_entry(self.author.revoke_device("alice", "dev-1"))
         self.assertEqual(node.authenticate_request("alice", "dev-1", 1, payload, sig_v1).reason, ReasonCode.REVOKED_DEVICE)
+
+    def test_preemptive_revoke_unregistered_actor(self) -> None:
+        node = Node.initialise(self.base / "pre", "feed-1", self.admin_pk)
+        pk, _ = generate_signing_keypair()
+        node.apply_entries([
+            self.author.genesis(),
+            self.author.revoke_actor("disabled-user"),
+        ])
+        self.assertEqual(node.authorize("disabled-user", "any-dev", 1).reason, ReasonCode.REVOKED_ACTOR)
+        res = node.apply_entry(self.author.register_key("disabled-user", "dev-1", pk))
+        self.assertFalse(res.applied)
 
 
 if __name__ == "__main__":
