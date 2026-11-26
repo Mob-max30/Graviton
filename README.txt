@@ -302,6 +302,12 @@ Algorithms:
       * Decapsulation: `ml_kem_768.decrypt(secret_key, ciphertext)` -> `shared_secret` (32 B)
       * Constants: `PUBLIC_KEY_SIZE = 1184`, `SECRET_KEY_SIZE = 2400`, `CIPHERTEXT_SIZE = 1088`, `PLAINTEXT_SIZE = 32`
       * Installs via prebuilt wheel on Python 3.12 with no extra system packages or compiler steps.
+    Verified ML-DSA-65 API:
+      * Import: `from pqcrypto.sign import ml_dsa_65`
+      * Key generation: `ml_dsa_65.generate_keypair()` -> `(public_key, secret_key)` (1952 B, 4032 B)
+      * Signing: `ml_dsa_65.sign(secret_key, message)` -> `signature` (3309 B)
+      * Verification: `ml_dsa_65.verify(public_key, message, signature)` -> `bool`
+      * Constants: `PUBLIC_KEY_SIZE = 1952`, `SECRET_KEY_SIZE = 4032`, `SIGNATURE_SIZE = 3309`
   - OPEN QUESTION (ask organizers before relying on it): the judging
     container is stated to have only Python 3.12 and pqcrypto==0.4.0,
     and submissions' dependencies are not installed. The standard
@@ -899,8 +905,7 @@ The demo script follows the objective-to-test matrix order so the
 [Fill in to match the real tree. Planned structure:]
 
   graviton/
-    adapter/        Sandbox adapter (Toolkit integration)
-    crypto/         Key establishment, signatures, AEAD, keystore
+    crypto/         ML-KEM-768, ML-DSA-65, RFC 5869 HKDF, AEAD/AAD, scrypt keystore
     nodes/          Enforcement node logic and local persisted state
     feed/           Signed, hash-chained policy/revocation feed
     lifecycle/      Rotation state machine, recovery, backups
