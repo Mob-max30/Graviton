@@ -1,4 +1,4 @@
-"""Graviton Phase 1 security engine for the Track 4 adapter contract."""
+"""Graviton security engine for the Track 4 adapter contract (Phase 4 wired)."""
 from __future__ import annotations
 
 import base64
@@ -9,14 +9,29 @@ import hmac
 import json
 import os
 from pathlib import Path
+import secrets
+import shutil
 import tempfile
 
 from pqcrypto.kem import ml_kem_768
 
-STATE_VERSION = 1
-STATE_FILENAME = "state.json"
+from graviton.crypto.signatures import generate_signing_keypair
+from graviton.feed.author import FeedAuthor
+from graviton.feed.entries import compute_entry_hash
+from graviton.nodes.node import Node, ReasonCode
+from graviton.storage import (
+    atomic_write_text as _atomic_write_text,
+    ensure_state_dir as _ensure_state_dir,
+    fsync_dir as _fsync_dir,
+    state_lock as _state_lock,
+)
+
+STATE_VERSION = 2
+POINTER_FILENAME = "current_generation.json"
+ADAPTER_STATE_FILENAME = "adapter_state.json"
+ADMIN_KEY_FILENAME = "admin_key.json"
 AUDIT_LOG_FILENAME = "audit_log.jsonl"
-LOCK_FILENAME = ".state.lock"
+NODE_SUBDIR = "node"
 
 
 def get_state_dir() -> Path:
@@ -27,86 +42,9 @@ def get_state_dir() -> Path:
     return Path(tempfile.gettempdir()) / "graviton_state"
 
 
-def _ensure_state_dir(state_dir: Path) -> None:
-    state_dir.mkdir(parents=True, exist_ok=True)
-    try:
-        os.chmod(state_dir, 0o700)
-    except OSError:
-        pass
-
-
-def _fsync_dir(directory: Path) -> None:
-    if os.name == "nt":
-        return
-    try:
-        fd = os.open(directory, os.O_RDONLY)
-        try:
-            os.fsync(fd)
-        finally:
-            os.close(fd)
-    except OSError:
-        pass
-
-
-@contextmanager
-def _state_lock(state_dir: Path):
-    """Cross-process exclusive file lock using only Python standard library."""
-    _ensure_state_dir(state_dir)
-    lock_path = state_dir / LOCK_FILENAME
-    fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
-    try:
-        if os.name == "nt":
-            import msvcrt
-
-            if os.fstat(fd).st_size == 0:
-                os.write(fd, b"\0")
-            os.lseek(fd, 0, os.SEEK_SET)
-            msvcrt.locking(fd, msvcrt.LK_LOCK, 1)
-            try:
-                yield
-            finally:
-                os.lseek(fd, 0, os.SEEK_SET)
-                msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
-        else:
-            import fcntl
-
-            fcntl.flock(fd, fcntl.LOCK_EX)
-            try:
-                yield
-            finally:
-                fcntl.flock(fd, fcntl.LOCK_UN)
-    finally:
-        os.close(fd)
-
-
-def _atomic_write_text(target: Path, content: str) -> None:
-    """Write content atomically via temp file + flush + fsync + os.replace."""
-    parent = target.parent
-    _ensure_state_dir(parent)
-    fd, tmp_name = tempfile.mkstemp(prefix=".tmp_", suffix=".part", dir=str(parent))
-    tmp_path = Path(tmp_name)
-    try:
-        try:
-            os.chmod(tmp_path, 0o600)
-        except OSError:
-            pass
-        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as handle:
-            handle.write(content)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(tmp_path, target)
-        _fsync_dir(parent)
-    except BaseException:
-        try:
-            tmp_path.unlink(missing_ok=True)
-        except OSError:
-            pass
-        raise
-
-
-def _append_audit_record(state_dir: Path, record: dict) -> None:
+def _append_audit_record(gen_dir: Path, record: dict) -> None:
     """Append a single canonical JSON-lines audit record durably."""
-    log_path = state_dir / AUDIT_LOG_FILENAME
+    log_path = gen_dir / AUDIT_LOG_FILENAME
     line = json.dumps(record, allow_nan=False, separators=(",", ":")) + "\n"
     fd = os.open(log_path, os.O_CREAT | os.O_WRONLY | os.O_APPEND, 0o600)
     try:
@@ -118,27 +56,47 @@ def _append_audit_record(state_dir: Path, record: dict) -> None:
         os.fsync(fd)
     finally:
         os.close(fd)
-    _fsync_dir(state_dir)
+    _fsync_dir(gen_dir)
 
 
-def _load_state(state_dir: Path) -> dict | None:
-    state_path = state_dir / STATE_FILENAME
+def _resolve_generation_dir(state_dir: Path) -> Path | None:
+    pointer_path = state_dir / POINTER_FILENAME
+    if not pointer_path.is_file():
+        return None
+    try:
+        pointer = json.loads(pointer_path.read_text(encoding="utf-8"))
+        if not isinstance(pointer, dict) or pointer.get("version") != STATE_VERSION:
+            return None
+        gen_name = pointer.get("generation")
+        if not isinstance(gen_name, str) or not gen_name.startswith("gen_"):
+            return None
+        if Path(gen_name).name != gen_name:
+            return None
+        gen_dir = state_dir / gen_name
+        if not gen_dir.is_dir():
+            return None
+        return gen_dir
+    except Exception:
+        return None
+
+
+def _load_adapter_state(gen_dir: Path) -> dict | None:
+    state_path = gen_dir / ADAPTER_STATE_FILENAME
     if not state_path.is_file():
         return None
-    data = json.loads(state_path.read_text(encoding="utf-8"))
-    if not isinstance(data, dict) or data.get("version") != STATE_VERSION:
-        raise ValueError("Unsupported or corrupted state schema")
-    return data
+    try:
+        data = json.loads(state_path.read_text(encoding="utf-8"))
+        if not isinstance(data, dict) or data.get("version") != STATE_VERSION:
+            return None
+        if not isinstance(data.get("owners"), dict) or not isinstance(data.get("contents"), dict):
+            return None
+        return data
+    except Exception:
+        return None
 
 
-def _save_state(state_dir: Path, state: dict) -> None:
-    state_path = state_dir / STATE_FILENAME
-    payload = json.dumps(state, allow_nan=False, separators=(",", ":"))
-    _atomic_write_text(state_path, payload)
-
-
-def _find_audit_record(state_dir: Path, request_id: str) -> dict | None:
-    log_path = state_dir / AUDIT_LOG_FILENAME
+def _find_audit_record(gen_dir: Path, request_id: str) -> dict | None:
+    log_path = gen_dir / AUDIT_LOG_FILENAME
     if not log_path.is_file():
         return None
     found = None
@@ -153,15 +111,31 @@ def _find_audit_record(state_dir: Path, request_id: str) -> dict | None:
     return found
 
 
-def _is_authorized(state: dict, actor: str, asset: str) -> bool:
-    disabled = set(state.get("disabled", []))
-    if actor in disabled:
-        return False
-    owners = state.get("owners", {})
-    contents = state.get("contents", {})
-    if asset not in owners or asset not in contents:
-        return False
-    return owners[asset] == actor
+def _cleanup_old_generations(state_dir: Path, active_name: str) -> None:
+    try:
+        for entry in state_dir.iterdir():
+            if entry.is_dir() and entry.name.startswith("gen_") and entry.name != active_name:
+                shutil.rmtree(entry, ignore_errors=True)
+    except OSError:
+        pass
+
+
+def _authorize_request(gen_dir: Path, state: dict, actor: str, asset: str) -> tuple[bool, str]:
+    """Evaluate ownership and node feed revocation; returns (allowed, internal_reason)."""
+    try:
+        node = Node(gen_dir / NODE_SUBDIR, freshness_window=None)
+        node_decision = node.check_actor(actor)
+        if node_decision.decision != "allow":
+            return False, node_decision.reason.value
+        owners = state["owners"]
+        contents = state["contents"]
+        if asset not in owners or asset not in contents:
+            return False, "UNKNOWN_ASSET"
+        if owners[asset] != actor:
+            return False, "NOT_OWNER"
+        return True, ReasonCode.OK.value
+    except Exception:
+        return False, ReasonCode.STATE_CORRUPT.value
 
 
 def _handle_setup(state_dir: Path, request: dict) -> dict:
@@ -181,15 +155,55 @@ def _handle_setup(state_dir: Path, request: dict) -> dict:
     if key_material is not None and not isinstance(key_material, str):
         return {"error": "invalid_key_material"}
 
-    state = {
+    gen_name = f"gen_{secrets.token_hex(12)}"
+    gen_dir = state_dir / gen_name
+    _ensure_state_dir(gen_dir)
+
+    admin_pk, admin_sk = generate_signing_keypair()
+    feed_id = secrets.token_hex(16)
+    node = Node.initialise(gen_dir / NODE_SUBDIR, feed_id, admin_pk, freshness_window=None)
+    author = FeedAuthor(feed_id, admin_sk)
+
+    genesis_bytes = author.genesis()
+    gen_res = node.apply_entry(genesis_bytes)
+    if not gen_res.applied:
+        return {"error": "setup_feed_failed"}
+
+    for actor in dict.fromkeys(disabled):
+        rev_bytes = author.revoke_actor(actor)
+        rev_res = node.apply_entry(rev_bytes)
+        if not rev_res.applied:
+            return {"error": "setup_revoke_failed"}
+
+    adapter_state = {
         "version": STATE_VERSION,
         "owners": dict(owners),
         "contents": dict(contents),
-        "disabled": list(dict.fromkeys(disabled)),
         "key_material": key_material if key_material is not None else "",
     }
-    _save_state(state_dir, state)
-    _atomic_write_text(state_dir / AUDIT_LOG_FILENAME, "")
+    _atomic_write_text(
+        gen_dir / ADAPTER_STATE_FILENAME,
+        json.dumps(adapter_state, allow_nan=False, separators=(",", ":")),
+    )
+
+    admin_key_state = {
+        "version": STATE_VERSION,
+        "feed_id": feed_id,
+        "admin_secret_key_b64": base64.b64encode(admin_sk).decode("ascii"),
+        "epoch": author.epoch,
+        "last_hash_hex": author.last_hash.hex(),
+    }
+    _atomic_write_text(
+        gen_dir / ADMIN_KEY_FILENAME,
+        json.dumps(admin_key_state, allow_nan=False, separators=(",", ":")),
+    )
+    _atomic_write_text(gen_dir / AUDIT_LOG_FILENAME, "")
+
+    _atomic_write_text(
+        state_dir / POINTER_FILENAME,
+        json.dumps({"version": STATE_VERSION, "generation": gen_name}, allow_nan=False, separators=(",", ":")),
+    )
+    _cleanup_old_generations(state_dir, gen_name)
     return {"ready": True}
 
 
@@ -200,14 +214,18 @@ def _handle_read(state_dir: Path, request: dict) -> dict:
     if not all(isinstance(x, str) for x in (actor, asset, request_id)):
         return {"error": "missing_or_invalid_fields"}
 
-    state = _load_state(state_dir)
-    if state is None:
-        return {"error": "not_initialized"}
+    gen_dir = _resolve_generation_dir(state_dir)
+    if gen_dir is None:
+        return {"decision": "deny"}
 
-    allowed = _is_authorized(state, actor, asset)
+    state = _load_adapter_state(gen_dir)
+    if state is None:
+        return {"decision": "deny"}
+
+    allowed, internal_reason = _authorize_request(gen_dir, state, actor, asset)
     decision = "allow" if allowed else "deny"
     _append_audit_record(
-        state_dir,
+        gen_dir,
         {
             "version": STATE_VERSION,
             "request_id": request_id,
@@ -215,6 +233,7 @@ def _handle_read(state_dir: Path, request: dict) -> dict:
             "actor": actor,
             "asset": asset,
             "decision": decision,
+            "reason": internal_reason,
         },
     )
     if allowed:
@@ -224,16 +243,46 @@ def _handle_read(state_dir: Path, request: dict) -> dict:
 
 def _handle_revoke(state_dir: Path, request: dict) -> dict:
     actor = request.get("actor")
-    if not isinstance(actor, str):
+    if not isinstance(actor, str) or not actor:
         return {"error": "missing_or_invalid_actor"}
 
-    state = _load_state(state_dir)
-    if state is None:
+    gen_dir = _resolve_generation_dir(state_dir)
+    if gen_dir is None:
         return {"error": "not_initialized"}
 
-    if actor not in state["disabled"]:
-        state["disabled"].append(actor)
-        _save_state(state_dir, state)
+    if _load_adapter_state(gen_dir) is None:
+        return {"error": "state_corrupt"}
+
+    node = Node(gen_dir / NODE_SUBDIR, freshness_window=None)
+    current = node.check_actor(actor)
+    if current.reason == ReasonCode.STATE_CORRUPT:
+        return {"error": "state_corrupt"}
+    if current.reason == ReasonCode.REVOKED_ACTOR:
+        return {}
+
+    admin_path = gen_dir / ADMIN_KEY_FILENAME
+    if not admin_path.is_file():
+        return {"error": "state_corrupt"}
+    try:
+        admin_data = json.loads(admin_path.read_text(encoding="utf-8"))
+        admin_sk = base64.b64decode(admin_data["admin_secret_key_b64"], validate=True)
+        author = FeedAuthor(admin_data["feed_id"], admin_sk)
+        author.epoch = int(admin_data["epoch"])
+        author.last_hash = bytes.fromhex(admin_data["last_hash_hex"])
+        rev_bytes = author.revoke_actor(actor)
+    except Exception:
+        return {"error": "revoke_author_failed"}
+
+    apply_res = node.apply_entry(rev_bytes)
+    if not apply_res.applied and apply_res.status != "already_applied":
+        return {"error": "revoke_apply_failed"}
+
+    admin_data["epoch"] = author.epoch
+    admin_data["last_hash_hex"] = compute_entry_hash(rev_bytes).hex()
+    _atomic_write_text(
+        admin_path,
+        json.dumps(admin_data, allow_nan=False, separators=(",", ":")),
+    )
     return {}
 
 
@@ -242,11 +291,17 @@ def _handle_audit(state_dir: Path, request: dict) -> dict:
     if not isinstance(request_id, str):
         return {"error": "missing_or_invalid_request_id"}
 
-    state = _load_state(state_dir)
-    if state is None:
+    gen_dir = _resolve_generation_dir(state_dir)
+    if gen_dir is None:
         return {"error": "not_initialized"}
 
-    record = _find_audit_record(state_dir, request_id)
+    if _load_adapter_state(gen_dir) is None:
+        return {"error": "state_corrupt"}
+
+    try:
+        record = _find_audit_record(gen_dir, request_id)
+    except Exception:
+        return {"error": "state_corrupt"}
     if record is None:
         return {"error": "unknown_request"}
     return {"request_id": record["request_id"], "decision": record["decision"]}
@@ -260,11 +315,16 @@ def _handle_protected_read(state_dir: Path, request: dict) -> dict:
     if not all(isinstance(x, str) for x in (actor, asset, challenge, public_key_b64)):
         return {"error": "missing_or_invalid_fields"}
 
-    state = _load_state(state_dir)
-    if state is None:
-        return {"error": "not_initialized"}
+    gen_dir = _resolve_generation_dir(state_dir)
+    if gen_dir is None:
+        return {"decision": "deny"}
 
-    if not _is_authorized(state, actor, asset):
+    state = _load_adapter_state(gen_dir)
+    if state is None:
+        return {"decision": "deny"}
+
+    allowed, _ = _authorize_request(gen_dir, state, actor, asset)
+    if not allowed:
         return {"decision": "deny"}
 
     try:

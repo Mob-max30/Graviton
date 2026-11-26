@@ -20,7 +20,11 @@ from graviton.feed.entries import (
     unpack_signed_entry,
 )
 from graviton.feed.verify import FeedContinuityError, FeedVerificationError, verify_entry
-from graviton_app import _atomic_write_text, _ensure_state_dir, _state_lock
+from graviton.storage import (
+    atomic_write_text as _atomic_write_text,
+    ensure_state_dir as _ensure_state_dir,
+    state_lock as _state_lock,
+)
 
 NODE_STATE_VERSION = 1
 NODE_STATE_FILENAME = "node_state.json"
