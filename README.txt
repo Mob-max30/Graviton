@@ -221,6 +221,17 @@ Rules:
   - An adapter smoke test runs on every commit so integration never
     silently breaks.
 
+  Adapter wiring (Phase 4):
+    - Revocation truth lives in the node's signed feed (`Node.check_actor`),
+      not in a separate adapter-level disabled list.
+    - `setup` generates a random `feed_id` (`secrets.token_hex(16)`) and
+      an ML-DSA-65 admin keypair stored in the state area (`admin_key.json`,
+      mode `0o600` inside `0o700` generation directory).
+    - `setup` is crash-safe via a fresh generation directory plus atomic
+      `current_generation.json` pointer switch.
+    - `read` and `protected_read` deny outputs never carry reason codes or
+      hints; internal reason codes are stored only in `audit_log.jsonl`.
+
 
 ---------------------------------------------------------------------
 5. SYSTEM ARCHITECTURE
@@ -274,6 +285,10 @@ brief):
     current policy epoch.
   - Recording: every decision (allow or deny, with reason) is written
     to the audit log with actor taken from the authenticated session.
+  - NOTE (Adapter path): in the adapter path (`track4_service.py`),
+    the Toolkit harness is the authenticated caller and the `actor`
+    field is trusted input. ML-DSA-65 request signatures (`Node.authenticate_request`)
+    are used by the node's request authentication API, not by the adapter.
 
 
 ---------------------------------------------------------------------
@@ -849,6 +864,14 @@ Limits: see section 23.
   - Actor IDs in Phase 1 adapter requests are treated as opaque
     strings per the Toolkit contract without external signature
     verification.
+  - Phase 4 adapter wiring limits: the admin ML-DSA-65 secret key sits
+    in the state directory in plaintext (mode 0o600) because the
+    per-process model gives no other place, so admin and node share a
+    trust domain in the adapter path; the feed grows with each revoke;
+    `Node.check_actor()` cost grows linearly with feed length (measured
+    median on Windows: 1.90 ms at 1 entry, 11.18 ms at 10 entries,
+    43.08 ms at 100 entries; end-to-end `read` subprocess p50: 468.85 ms
+    at 1 revoke, 493.07 ms at 10 revokes, 506.10 ms at 100 revokes).
   - A compromised host administrator or a compromised host machine
     is out of scope; the SQLite host is trusted for availability and
     for storing queued ciphertext.
