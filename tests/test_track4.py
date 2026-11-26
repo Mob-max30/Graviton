@@ -54,6 +54,11 @@ def test_gt_cli_integrated_with_trustledger(tmp_path: Path, monkeypatch, capsys)
         ]
     assert names == ["finance - 1", "finance - 2"]
 
+    assert graviton_cli.main(["people"]) == 0
+    people_out = capsys.readouterr().out
+    assert "finance - 1 [finance] -> IP: 127.0.0.1" in people_out
+    assert "finance - 2 [finance] -> IP: 127.0.0.1" in people_out
+
     # 5. Unreachable / invalid IP rejected
     assert graviton_cli.check_device_reachable("not-an-ip") is False
 

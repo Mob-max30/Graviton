@@ -631,6 +631,31 @@ def cmd_chat() -> None:
         logger.append_entry(me["user_id"], "CHAT_SEND", peer["user_id"], "allow")
 
 
+def cmd_people() -> None:
+    """List all members, their positions, and their connected device IPs."""
+    with _connect() as conn:
+        org = _get_active_org(conn)
+        if _is_admin_ip(conn, org):
+            print(f"({org['name']})")
+        rows = conn.execute(
+            """
+            SELECT u.username, u.identifier, u.is_admin, d.device_ip, d.status
+            FROM users u
+            JOIN devices d ON u.user_id = d.user_id
+            WHERE u.org_id = ?
+            ORDER BY u.created_at ASC
+            """,
+            (org["org_id"],),
+        ).fetchall()
+
+    if not rows:
+        print("No members found.")
+        return
+    for r in rows:
+        role_tag = " [admin]" if r["is_admin"] else f" [{r['identifier']}]"
+        print(f"{r['username']}{role_tag} -> IP: {r['device_ip']} ({r['status']})")
+
+
 def cmd_prompt() -> None:
     f = _active_org_file()
     if not f.exists():
@@ -668,6 +693,7 @@ def main(argv: list[str] | None = None) -> int:
         print("  gt -register <company-name>")
         print("  gt use <company-name>")
         print("  gt ls [folder-name]")
+        print("  gt people")
         print("  gt -add <file-or-folder-path>")
         print("  gt -add-people")
         print("  gt -chat")
@@ -688,6 +714,9 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if flag in ("ls", "-ls", "--ls"):
         cmd_ls(args[1] if len(args) > 1 else None)
+        return 0
+    if flag in ("people", "-list", "--list"):
+        cmd_people()
         return 0
     if flag in ("prompt", "-prompt"):
         cmd_prompt()
