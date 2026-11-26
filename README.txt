@@ -597,9 +597,10 @@ Explainable alerts: every alert contains
   - the rule or graph path that fired and why.
 
 Labelled data:
-  - Labelled logs are taken from the Toolkit if supplied; otherwise
-    a labelled generator produces benign and malicious scenarios with
-    ground truth. [state which]
+  - Labelled logs use the Toolkit practice schema (`events.csv`,
+    `approvals.json`, `labels.csv`) together with a deterministic
+    labelled generator (`graviton.detect.eval.generate_labelled_dataset`,
+    seed=42, 1,000 benign + 20 attack scenarios) with ground truth.
   - The generator and its seeds are committed so results are
     reproducible.
 
@@ -622,8 +623,9 @@ Design:
   - Events are buffered behind a watermark so late arrivals within
     the window are reordered correctly.
   - Per-source clock offsets are estimated and applied.
-  - Supported timing range: events with skew up to +/- [N] seconds
-    and arrival delay up to [M] seconds are ordered correctly.
+  - Supported timing range: events with skew up to +/- 5 seconds
+    (`MAX_SKEW_MS = 5000`) and arrival delay up to 10 seconds
+    (`MAX_DELAY_MS = 10000`) are ordered correctly.
     These numbers are stated here, in the PDF brief and in the tests.
   - Outside the supported range, or when two events' ordering depends
     on an offset uncertainty larger than their time gap, the detector
