@@ -361,10 +361,12 @@ Design:
   - Rotation announces a new version through the signed policy feed
     with an explicit cutoff expressed as a policy epoch (and
     wall-clock time for human reading).
-  - Before the cutoff: both the old and new versions are accepted so
+  - Before the cutoff (`applied_epoch < cutoff_epoch`): both the old
+    and new key versions are accepted (the transition window) so
     authorised transfers continue uninterrupted.
-  - After the cutoff: nodes reject NEW requests that use the old key.
-  - Grace period: [state exact value, e.g. "N seconds" or "none"].
+  - After the cutoff (`applied_epoch >= cutoff_epoch`): nodes reject
+    NEW requests that use the old key (`KEY_RETIRED`).
+  - Grace period: none (0 epochs / 0 seconds after the cutoff epoch).
     This value is documented here, in the PDF brief and in the test
     that asserts it.
   - Messages already in flight at the cutoff: [state behaviour,
@@ -387,20 +389,41 @@ propagation mechanism or latency measurement.
 Mechanism:
   - Revocations are entries in a signed, versioned, hash-chained feed
     with a monotonic epoch.
+  - Feed encoding: canonical big-endian length-prefixed binary format
+    (`graviton/feed/encoding.py`), `MAX_ID_LEN = 256`,
+    `MAX_ENTRY_LEN = 16384`, signed with ML-DSA-65 (`domain=b"feed"`),
+    hash-chained via SHA-256 over the full serialized entry.
   - Each node verifies the feed signature and chain before applying.
-  - Each node persists its applied epoch and REFUSES to roll back to
-    an older epoch.
-  - A node that cannot confirm freshness within [configured window]
-    fails closed.
+  - Each node persists its applied epoch (`node_state.json`, version 1:
+    pinned `feed_id`, `admin_public_key_b64`, `applied_epoch`,
+    `last_entry_hash_hex`, `applied_entries`, `last_issued_at`,
+    `registry`, `revoked_actors`) and REFUSES to roll back to an
+    older epoch.
+  - Freshness window: default `None` (freshness not enforced, used by
+    the adapter path); the multi-node harness uses `30` seconds. When
+    set, a node that cannot confirm freshness within `freshness_window`
+    seconds (`clock() - last_issued_at > freshness_window`) fails
+    closed with `STALE_STATE`.
   - Revocations are never undone by any recovery path (section 10).
 
 Measurement:
-  - A timestamp is recorded when the revocation is issued.
-  - Each node records when it begins enforcing (first rejection
-    capability at the new epoch).
+  - A timestamp (`time.monotonic_ns`) is recorded immediately before
+    the revocation entry delivery begins.
+  - Nodes are simulated as separate state directories on one host
+    (not separate machines), with entries delivered in parallel
+    threads and configurable seeded millisecond delays.
+  - Each node records when a real `Node.authorize()` call first
+    returns `deny` after its atomic apply has persisted.
   - Reported figure: time from revocation issue until the LAST node
-    enforces it. The benchmark script (section 20) prints this per
-    run, with the node count and conditions.
+    enforces it, alongside node count, delay range, and pure compute
+    time.
+
+Phase 3 status and known limits:
+  - Admin key is pinned at node initialisation and is not rotatable.
+  - `applied_entries` grows without bound in `node_state.json`.
+  - Clocks are not synchronised across real machines; freshness
+    compares the admin's `issued_at` timestamp against the node's own
+    clock.
 
 
 ---------------------------------------------------------------------
