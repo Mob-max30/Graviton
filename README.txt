@@ -654,9 +654,11 @@ Design:
     authentication fail and the message is rejected.
   - The receiver keeps a cache of seen message IDs / counters per
     session and rejects duplicates.
-  - Cache size and retention behaviour: [state, including what
-    happens when the cache is full or after restart; the cache is
-    persisted so replay across restart is also rejected].
+  - Cache size and retention behaviour: up to 10,000 counters per
+    session (`ReplayCache`); when full, the oldest counters are evicted
+    and a monotonic `floor` is advanced so evicted counters remain
+    rejected. The cache is persisted atomically on every accepted
+    message so replay across restart is also rejected.
 
 Test evidence: a replayed message is rejected; a message with altered
 recipient field is rejected; a third party cannot decrypt.
@@ -694,8 +696,8 @@ Design:
   - Messages are split into numbered chunks with total-count
     metadata, each authenticated.
   - The receiver reassembles by number so reordering is tolerated.
-  - Missing chunks are requested for retransmission up to
-    [N retries / T timeout].
+  - Missing chunks are requested for retransmission up to 3 retries
+    (`DEFAULT_MAX_RETRIES = 3`).
   - If recovery succeeds: the complete, authenticated message is
     delivered.
   - If recovery fails or any chunk is invalid: the partial message is
@@ -725,7 +727,7 @@ Design (resumption is supported):
   - A different identity presenting the same session ID is rejected
     and the attempt is logged.
   - Tickets are revoked when the peer's key is rotated or revoked.
-  - Tickets expire after [state lifetime].
+  - Tickets expire after 3600 seconds (`DEFAULT_TICKET_LIFETIME_S = 3600`).
 
 Test evidence: legitimate resume succeeds; resume by another identity
 with the same session ID fails.
