@@ -938,9 +938,9 @@ listed above. This is a common failure point.
   - Run the benchmark/evaluation:   [command, see section 20]
   - Run the demo walkthrough:       [command or script mirroring the
                                       section 19 matrix]
-  - Fault-injection suite:          [command]
+  - Fault-injection suite:          python -m unittest tests/test_crash_recovery.py -v
   - Log verification:               python -m graviton.audit verify --db <db> --head <head.json>
-  - Backup verification:            [command]
+  - Backup verification:            python -m unittest tests/test_backup_integrity.py -v
 
 The demo script follows the objective-to-test matrix order so the
 5-minute video and the live demo cover the same ground.
