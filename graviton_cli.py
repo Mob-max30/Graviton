@@ -767,6 +767,30 @@ def cmd_people() -> None:
             print(f"  - {m['username']} -> IP: {m['device_ip']} ({m['status']})")
 
 
+def cmd_orgs() -> None:
+    """List all organizations this device IP belongs to."""
+    ips = _current_machine_ips()
+    active_id = _active_org_file().read_text(encoding="utf-8").strip() if _active_org_file().exists() else ""
+    with _connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT o.org_id, o.name, u.username, u.identifier, u.is_admin, d.device_ip
+            FROM organizations o
+            JOIN users u ON o.org_id = u.org_id
+            JOIN devices d ON u.user_id = d.user_id AND d.status = 'ACTIVE'
+            ORDER BY o.created_at DESC
+            """
+        ).fetchall()
+
+    matched = [r for r in rows if r["device_ip"] in ips]
+    if not matched:
+        print("This device is not added to any organization.")
+        return
+    for r in matched:
+        mark = "* " if r["org_id"] == active_id else "  "
+        print(f"{mark}{r['name']} -> {r['username']} [{r['identifier']}] (IP: {r['device_ip']})")
+
+
 def cmd_prompt() -> None:
     f = _active_org_file()
     if not f.exists():
@@ -803,6 +827,7 @@ def main(argv: list[str] | None = None) -> int:
         print("Usage:")
         print("  gt -register <company-name>")
         print("  gt use <company-name>")
+        print("  gt orgs")
         print("  gt ls [folder-name]")
         print("  gt people")
         print("  gt -add <file-or-folder-path>")
@@ -822,6 +847,9 @@ def main(argv: list[str] | None = None) -> int:
             print("Usage: gt use <company-name>")
             return 1
         cmd_use(args[1])
+        return 0
+    if flag in ("orgs", "-orgs", "--orgs"):
+        cmd_orgs()
         return 0
     if flag in ("ls", "-ls", "--ls"):
         cmd_ls(args[1] if len(args) > 1 else None)

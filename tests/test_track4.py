@@ -17,6 +17,8 @@ def test_gt_cli_integrated_with_trustledger(tmp_path: Path, monkeypatch, capsys)
     # 2. gt use + gt prompt
     assert graviton_cli.main(["use", "AcmeVault"]) == 0
     assert "(AcmeVault)" in capsys.readouterr().out
+    assert graviton_cli.main(["orgs"]) == 0
+    assert "AcmeVault -> alice [admin]" in capsys.readouterr().out
     assert graviton_cli.main(["prompt"]) == 0
     assert capsys.readouterr().out == " (AcmeVault)"
 
