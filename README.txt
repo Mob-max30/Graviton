@@ -538,12 +538,13 @@ Design:
     authenticated session, never from user-supplied input.
   - Append-only: enforced at the database level (no UPDATE/DELETE
     permitted on the log table, e.g. via restrictions/triggers).
-  - External head hash: the latest chain head is kept somewhere
-    outside the database so a wholesale rewrite of the database is
-    detectable. [state location]
-  - Operator verification: a command (e.g. `graviton log verify`)
-    walks the chain, checks signatures and head hash, and reports the
-    first inconsistency.
+  - External head hash: the latest chain head (`seq` + `head_hash_hex`)
+    is persisted atomically in a separate `audit_head.json` file outside
+    the SQLite database so a wholesale rewrite of the database is
+    detectable.
+  - Operator verification: `python -m graviton.audit verify --db <db>
+    --head <head.json> [--pubkey-b64 <pk>]` walks the chain, checks
+    signatures and head hash, and reports the first inconsistency.
 
 Test evidence: injected newline/fake-record text appears as inert data
 inside a single event; attempts to edit or delete rows are rejected or
@@ -938,7 +939,7 @@ listed above. This is a common failure point.
   - Run the demo walkthrough:       [command or script mirroring the
                                       section 19 matrix]
   - Fault-injection suite:          [command]
-  - Log verification:               [command]
+  - Log verification:               python -m graviton.audit verify --db <db> --head <head.json>
   - Backup verification:            [command]
 
 The demo script follows the objective-to-test matrix order so the
