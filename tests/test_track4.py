@@ -288,3 +288,88 @@ def test_fastapi_end_to_end(tmp_path: Path):
 
     r_bench = client.get("/api/detector/benchmark")
     assert r_bench.json()["f1"] == 1.0
+
+    # Multipart file upload stored encrypted under company-named directory
+    r_up = client.post(
+        f"/api/orgs/{org_id}/resources/upload",
+        data={
+            "actor_user_id": org["admin_user_id"],
+            "actor_device_id": org["admin_device_id"],
+            "allowed_identifiers": "finance",
+            "allowed_users": "",
+        },
+        files={"file": ("ledger.txt", b"confidential-ledger-bytes", "text/plain")},
+    )
+    assert r_up.status_code == 200
+    up_id = r_up.json()["resource_id"]
+    vault_files = list((tmp_path / "orgs").rglob(f"{up_id}.enc"))
+    assert len(vault_files) == 1
+    assert "CyberCorp_" in str(vault_files[0])
+    assert b"confidential-ledger-bytes" not in vault_files[0].read_bytes()
+
+    r_up_acc = client.post(
+        f"/api/orgs/{org_id}/resources/{up_id}/access",
+        json={"actor_user_id": bob["user_id"], "actor_device_id": bob["device_id"]},
+    )
+    assert r_up_acc.status_code == 200
+    assert r_up_acc.json()["content_text"] == "confidential-ledger-bytes"
+
+
+def test_toolkit_adapter_contract(tmp_path: Path):
+    import hashlib
+    import hmac
+    import os
+    import subprocess
+    import sys
+    from pqcrypto.kem import ml_kem_768
+
+    entry = Path(__file__).resolve().parent.parent / "track4_service.py"
+    env = os.environ.copy()
+    env["TRACK4_STATE_DIR"] = str(tmp_path)
+
+    def call_adapter(payload: dict) -> dict:
+        proc = subprocess.run(
+            [sys.executable, "-B", str(entry)],
+            input=json.dumps(payload).encode("utf-8"),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=env,
+            check=True,
+        )
+        return json.loads(proc.stdout.decode("utf-8"))
+
+    assert call_adapter({
+        "op": "setup",
+        "owners": {"brief": "maya", "ledger": "liam"},
+        "contents": {"brief": "demo note", "ledger": "liam data"},
+        "disabled": [],
+        "key_material": "synthetic-only",
+    }) == {"ready": True}
+
+    assert call_adapter({"op": "read", "actor": "maya", "asset": "brief", "request_id": "r01"}) == {
+        "decision": "allow",
+        "body": "demo note",
+    }
+
+    # Protected read ML-KEM-768 + HMAC-SHA-256 interoperability
+    pk, sk = ml_kem_768.keygen()
+    challenge = "chal-12345"
+    pr = call_adapter({
+        "op": "protected_read",
+        "actor": "maya",
+        "asset": "brief",
+        "challenge": challenge,
+        "public_key": base64.b64encode(bytes(pk)).decode("ascii"),
+    })
+    ss = ml_kem_768.decaps(sk, base64.b64decode(pr["ciphertext"]))
+    expected_proof = hmac.new(bytes(ss), (challenge + "demo note").encode("utf-8"), hashlib.sha256).hexdigest()
+    assert pr["proof"] == expected_proof
+
+    # Revoke maya -> denied + audited, liam unaffected
+    call_adapter({"op": "revoke", "actor": "maya"})
+    assert call_adapter({"op": "read", "actor": "maya", "asset": "brief", "request_id": "r02"}) == {"decision": "deny"}
+    assert call_adapter({"op": "audit", "request_id": "r02"}) == {"request_id": "r02", "decision": "deny"}
+    assert call_adapter({"op": "read", "actor": "liam", "asset": "ledger", "request_id": "r03"}) == {
+        "decision": "allow",
+        "body": "liam data",
+    }

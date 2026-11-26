@@ -5,10 +5,11 @@ from __future__ import annotations
 import base64
 import json
 import os
+import socket
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
@@ -84,6 +85,24 @@ class AccessResourceReq(BaseModel):
     actor_user_id: str
     actor_device_id: str
     node_id: str | None = None
+
+
+class UpdateAclReq(BaseModel):
+    actor_user_id: str
+    allowed_identifiers: list[str] = Field(default_factory=list)
+    allowed_users: list[str] = Field(default_factory=list)
+
+
+class CreateFolderReq(BaseModel):
+    actor_user_id: str
+    actor_device_id: str
+    name: str = Field(min_length=1, max_length=128)
+    allowed_identifiers: list[str] = Field(default_factory=lambda: ["admin"])
+
+
+class RenameResourceReq(BaseModel):
+    actor_user_id: str
+    new_name: str = Field(min_length=1, max_length=128)
 
 
 class SessionReq(BaseModel):
@@ -178,6 +197,8 @@ def create_app(db_path: str | None = None) -> FastAPI:
             ).fetchall()
         return {
             "org": dict(org),
+            "server_host": socket.gethostname(),
+            "storage_dir": str(storage.org_storage_dir(org_id)),
             "users": [dict(u) for u in users],
             "devices": [dict(d) for d in devices],
             "key_versions": [dict(k) for k in keys],
@@ -207,6 +228,13 @@ def create_app(db_path: str | None = None) -> FastAPI:
             return key_mgr.update_user_identifier(
                 org_id, req.actor_user_id, user_id, req.new_identifier, req.new_role, req.approved_ticket
             )
+        except KeyLifecycleError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.delete("/api/orgs/{org_id}/users/{user_id}")
+    def remove_user(org_id: str, user_id: str, admin_user_id: str) -> dict[str, Any]:
+        try:
+            return key_mgr.remove_user(org_id, admin_user_id, user_id)
         except KeyLifecycleError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -269,9 +297,66 @@ def create_app(db_path: str | None = None) -> FastAPI:
         except (StorageAccessError, KeyLifecycleError) as exc:
             raise HTTPException(status_code=403, detail=str(exc)) from exc
 
+    @app.post("/api/orgs/{org_id}/resources/upload")
+    async def upload_resource_file(
+        org_id: str,
+        actor_user_id: str = Form(...),
+        actor_device_id: str = Form(...),
+        allowed_identifiers: str = Form(""),
+        allowed_users: str = Form(""),
+        file: UploadFile = File(...),
+    ) -> dict[str, Any]:
+        try:
+            raw_bytes = await file.read()
+            ids = [s.strip() for s in allowed_identifiers.split(",") if s.strip()]
+            usrs = [s.strip() for s in allowed_users.split(",") if s.strip()]
+            return storage.add_resource(
+                org_id,
+                actor_user_id,
+                actor_device_id,
+                file.filename or "uploaded_file",
+                raw_bytes,
+                ids,
+                usrs,
+            )
+        except (StorageAccessError, KeyLifecycleError) as exc:
+            raise HTTPException(status_code=403, detail=str(exc)) from exc
+
     @app.get("/api/orgs/{org_id}/resources")
     def list_resources(org_id: str) -> list[dict[str, Any]]:
         return storage.list_resources(org_id)
+
+    @app.post("/api/orgs/{org_id}/folders")
+    def create_folder(org_id: str, req: CreateFolderReq) -> dict[str, Any]:
+        try:
+            return storage.create_folder(
+                org_id, req.actor_user_id, req.actor_device_id, req.name, req.allowed_identifiers
+            )
+        except (StorageAccessError, KeyLifecycleError) as exc:
+            raise HTTPException(status_code=403, detail=str(exc)) from exc
+
+    @app.put("/api/orgs/{org_id}/resources/{resource_id}/rename")
+    def rename_resource(org_id: str, resource_id: str, req: RenameResourceReq) -> dict[str, Any]:
+        try:
+            return storage.rename_resource(org_id, req.actor_user_id, resource_id, req.new_name)
+        except StorageAccessError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @app.delete("/api/orgs/{org_id}/resources/{resource_id}")
+    def delete_resource(org_id: str, resource_id: str, actor_user_id: str) -> dict[str, Any]:
+        try:
+            return storage.delete_resource(org_id, actor_user_id, resource_id)
+        except StorageAccessError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @app.put("/api/orgs/{org_id}/resources/{resource_id}/acl")
+    def update_resource_acl(org_id: str, resource_id: str, req: UpdateAclReq) -> dict[str, Any]:
+        try:
+            return storage.update_resource_acl(
+                org_id, req.actor_user_id, resource_id, req.allowed_identifiers, req.allowed_users
+            )
+        except StorageAccessError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
 
     @app.post("/api/orgs/{org_id}/resources/{resource_id}/access")
     def access_resource(org_id: str, resource_id: str, req: AccessResourceReq) -> dict[str, Any]:

@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import json
+import os
+import re
 import time
 import uuid
+from pathlib import Path
 from typing import Any
 
 from app.audit import AuditLogger
@@ -17,13 +20,30 @@ class StorageAccessError(Exception):
     """Raised when resource access is denied or decryption fails."""
 
 
+def _safe_org_dirname(org_name: str, org_id: str) -> str:
+    slug = re.sub(r"[^A-Za-z0-9._-]+", "_", org_name.strip()).strip("_") or "org"
+    return f"{slug}_{org_id}"
+
+
 class ResourceStorage:
     """Manages encrypted resources and identifier/user ACL enforcement."""
 
-    def __init__(self, db: Database, key_mgr: KeyManager, audit: AuditLogger) -> None:
+    def __init__(self, db: Database, key_mgr: KeyManager, audit: AuditLogger, vault_root: str | None = None) -> None:
         self.db = db
         self.key_mgr = key_mgr
         self.audit = audit
+        default_root = os.path.join(os.path.dirname(os.path.abspath(db.db_path)), "orgs")
+        self.vault_root = Path(vault_root or default_root)
+        self.vault_root.mkdir(parents=True, exist_ok=True)
+
+    def org_storage_dir(self, org_id: str) -> Path:
+        """Return the company-named encrypted storage directory for an organization."""
+        with self.db.read() as conn:
+            row = conn.execute("SELECT name FROM organizations WHERE org_id = ?", (org_id,)).fetchone()
+        org_name = row["name"] if row else org_id
+        d = self.vault_root / _safe_org_dirname(org_name, org_id) / "resources"
+        d.mkdir(parents=True, exist_ok=True)
+        return d
 
     def add_resource(
         self,
@@ -86,6 +106,9 @@ class ResourceStorage:
                     now,
                 ),
             )
+
+        enc_path = self.org_storage_dir(org_id) / f"{resource_id}.enc"
+        enc_path.write_bytes(nonce + ct)
 
         self.audit.log_event(
             org_id=org_id,
@@ -219,13 +242,14 @@ class ResourceStorage:
         """List resource metadata (never returning plaintext)."""
         with self.db.read() as conn:
             rows = conn.execute(
-                "SELECT resource_id, name, owner_user_id, allowed_identifiers_json, allowed_users_json, key_version, created_at FROM resources WHERE org_id = ? ORDER BY created_at DESC",
+                "SELECT resource_id, name, kind, owner_user_id, allowed_identifiers_json, allowed_users_json, key_version, created_at FROM resources WHERE org_id = ? ORDER BY created_at DESC",
                 (org_id,),
             ).fetchall()
         return [
             {
                 "resource_id": r["resource_id"],
                 "name": r["name"],
+                "kind": r["kind"],
                 "owner_user_id": r["owner_user_id"],
                 "allowed_identifiers": json.loads(r["allowed_identifiers_json"]),
                 "allowed_users": json.loads(r["allowed_users_json"]),
@@ -234,3 +258,138 @@ class ResourceStorage:
             }
             for r in rows
         ]
+
+    def create_folder(
+        self,
+        org_id: str,
+        actor_user_id: str,
+        actor_device_id: str,
+        folder_name: str,
+        allowed_identifiers: list[str] | None = None,
+    ) -> dict[str, Any]:
+        """Create a named folder entry in the company vault."""
+        res = self.add_resource(
+            org_id,
+            actor_user_id,
+            actor_device_id,
+            folder_name,
+            b"",
+            allowed_identifiers or ["admin"],
+            [],
+        )
+        with self.db.tx() as conn:
+            conn.execute(
+                "UPDATE resources SET kind = 'folder' WHERE resource_id = ? AND org_id = ?",
+                (res["resource_id"], org_id),
+            )
+        res["kind"] = "folder"
+        return res
+
+    def rename_resource(self, org_id: str, actor_user_id: str, resource_id: str, new_name: str) -> dict[str, Any]:
+        """Rename a file or folder and re-bind its AEAD AAD."""
+        with self.db.tx() as conn:
+            res = conn.execute(
+                "SELECT * FROM resources WHERE resource_id = ? AND org_id = ?",
+                (resource_id, org_id),
+            ).fetchone()
+            if not res:
+                raise StorageAccessError("Resource not found")
+            kv = conn.execute(
+                "SELECT symmetric_key FROM key_versions WHERE org_id = ? AND version = ?",
+                (org_id, res["key_version"]),
+            ).fetchone()
+            if not kv:
+                raise StorageAccessError("Resource key version unavailable")
+
+            pt = aead_decrypt(
+                bytes(kv["symmetric_key"]),
+                bytes(res["nonce"]),
+                bytes(res["ciphertext"]),
+                res["aad_json"].encode("utf-8"),
+            )
+            new_aad = canonical_json(
+                {
+                    "org_id": org_id,
+                    "resource_id": resource_id,
+                    "name": new_name,
+                    "key_version": res["key_version"],
+                }
+            )
+            new_nonce, new_ct = aead_encrypt(bytes(kv["symmetric_key"]), pt, new_aad)
+            conn.execute(
+                "UPDATE resources SET name = ?, nonce = ?, ciphertext = ?, aad_json = ? WHERE resource_id = ? AND org_id = ?",
+                (new_name, new_nonce, new_ct, new_aad.decode("utf-8"), resource_id, org_id),
+            )
+
+        enc_path = self.org_storage_dir(org_id) / f"{resource_id}.enc"
+        enc_path.write_bytes(new_nonce + new_ct)
+
+        self.audit.log_event(
+            org_id=org_id,
+            actor_id=actor_user_id,
+            service="storage",
+            action="RESOURCE_RENAME",
+            target=resource_id,
+            context={"new_name": new_name},
+        )
+        return {"resource_id": resource_id, "name": new_name}
+
+    def delete_resource(self, org_id: str, actor_user_id: str, resource_id: str) -> dict[str, Any]:
+        """Delete an encrypted resource from DB and disk."""
+        with self.db.tx() as conn:
+            res = conn.execute(
+                "SELECT name FROM resources WHERE resource_id = ? AND org_id = ?",
+                (resource_id, org_id),
+            ).fetchone()
+            if not res:
+                raise StorageAccessError("Resource not found")
+            conn.execute("DELETE FROM resources WHERE resource_id = ? AND org_id = ?", (resource_id, org_id))
+
+        enc_path = self.org_storage_dir(org_id) / f"{resource_id}.enc"
+        if enc_path.exists():
+            enc_path.unlink()
+
+        self.audit.log_event(
+            org_id=org_id,
+            actor_id=actor_user_id,
+            service="storage",
+            action="RESOURCE_DELETE",
+            target=resource_id,
+            context={"name": res["name"]},
+        )
+        return {"deleted": True, "resource_id": resource_id}
+
+    def update_resource_acl(
+        self,
+        org_id: str,
+        actor_user_id: str,
+        resource_id: str,
+        allowed_identifiers: list[str],
+        allowed_users: list[str],
+    ) -> dict[str, Any]:
+        """Update allowed identifiers and users for a resource."""
+        with self.db.tx() as conn:
+            res = conn.execute(
+                "SELECT name FROM resources WHERE resource_id = ? AND org_id = ?",
+                (resource_id, org_id),
+            ).fetchone()
+            if not res:
+                raise StorageAccessError("Resource not found")
+            conn.execute(
+                "UPDATE resources SET allowed_identifiers_json = ?, allowed_users_json = ? WHERE resource_id = ? AND org_id = ?",
+                (json.dumps(allowed_identifiers), json.dumps(allowed_users), resource_id, org_id),
+            )
+
+        self.audit.log_event(
+            org_id=org_id,
+            actor_id=actor_user_id,
+            service="storage",
+            action="RESOURCE_ACL_UPDATE",
+            target=resource_id,
+            context={"allowed_identifiers": allowed_identifiers, "allowed_users": allowed_users},
+        )
+        return {
+            "resource_id": resource_id,
+            "allowed_identifiers": allowed_identifiers,
+            "allowed_users": allowed_users,
+        }

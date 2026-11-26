@@ -185,6 +185,9 @@ class Database:
     def _init_schema(self) -> None:
         with self.tx() as conn:
             conn.executescript(SCHEMA_SQL)
+            cols = {r["name"] for r in conn.execute("PRAGMA table_info(resources)").fetchall()}
+            if "kind" not in cols:
+                conn.execute("ALTER TABLE resources ADD COLUMN kind TEXT NOT NULL DEFAULT 'file'")
 
     @contextmanager
     def tx(self) -> Iterator[sqlite3.Connection]:

@@ -283,6 +283,37 @@ class KeyManager:
             "role": role_to_set,
         }
 
+    def remove_user(self, org_id: str, admin_user_id: str, target_user_id: str) -> dict[str, Any]:
+        """Remove a non-admin member and their devices from the organization."""
+        with self.db.tx() as conn:
+            admin = conn.execute(
+                "SELECT is_admin FROM users WHERE user_id = ? AND org_id = ?",
+                (admin_user_id, org_id),
+            ).fetchone()
+            if not admin or not admin["is_admin"]:
+                raise KeyLifecycleError("Only an admin can remove users")
+
+            target = conn.execute(
+                "SELECT username, is_admin FROM users WHERE user_id = ? AND org_id = ?",
+                (target_user_id, org_id),
+            ).fetchone()
+            if not target:
+                raise KeyLifecycleError("User not found")
+            if target["is_admin"]:
+                raise KeyLifecycleError("Cannot remove organization admin")
+
+            conn.execute("DELETE FROM users WHERE user_id = ? AND org_id = ?", (target_user_id, org_id))
+
+        self.audit.log_event(
+            org_id=org_id,
+            actor_id=admin_user_id,
+            service="iam",
+            action="USER_REMOVE",
+            target=target_user_id,
+            context={"username": target["username"]},
+        )
+        return {"removed": True, "user_id": target_user_id}
+
     def rotate_key(
         self,
         org_id: str,

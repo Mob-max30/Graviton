@@ -1,5 +1,6 @@
 let currentOrgId = null;
 let currentOverview = null;
+let currentResources = [];
 let currentSessionId = null;
 
 const $ = (id) => document.getElementById(id);
@@ -7,7 +8,7 @@ const $ = (id) => document.getElementById(id);
 function showToast(msg, isErr = false) {
   const t = $("toast");
   t.textContent = msg;
-  t.style.borderColor = isErr ? "#ef4444" : "#38bdf8";
+  t.style.borderColor = isErr ? "rgba(255, 255, 255, 0.55)" : "rgba(255, 255, 255, 0.22)";
   t.style.display = "block";
   setTimeout(() => { t.style.display = "none"; }, 3500);
 }
@@ -21,36 +22,46 @@ async function api(path, method = "GET", body = null) {
   return data;
 }
 
-document.querySelectorAll(".tab").forEach((btn) => {
+function showWorkspaceView() {
+  $("view-register").classList.remove("active");
+  $("view-workspace").classList.add("active");
+  backToHub();
+}
+
+window.backToHub = () => {
+  $("mainContainer").classList.remove("workspace-mode");
+  $("iconHub").style.display = "flex";
+  document.querySelectorAll(".wpanel").forEach((p) => p.classList.remove("active"));
+};
+
+document.querySelectorAll(".hub-icon-btn").forEach((btn) => {
   btn.addEventListener("click", () => {
-    document.querySelectorAll(".tab").forEach((b) => b.classList.remove("active"));
-    document.querySelectorAll(".panel").forEach((p) => p.classList.remove("active"));
-    btn.classList.add("active");
-    $(`tab-${btn.dataset.tab}`).classList.add("active");
+    $("iconHub").style.display = "none";
+    $("mainContainer").classList.add("workspace-mode");
+    document.querySelectorAll(".wpanel").forEach((p) => p.classList.remove("active"));
+    $(`wtab-${btn.dataset.wtab}`).classList.add("active");
   });
 });
 
 async function loadOrgs() {
   const orgs = await api("/api/orgs");
-  const sel = $("orgSelect");
-  sel.innerHTML = "";
-  orgs.forEach((o) => {
-    const opt = document.createElement("option");
-    opt.value = o.org_id;
-    opt.textContent = `${o.name} (${o.org_id})`;
-    sel.appendChild(opt);
-  });
-  if (orgs.length && !currentOrgId) currentOrgId = orgs[0].org_id;
-  if (currentOrgId) {
-    sel.value = currentOrgId;
-    await refreshOverview();
+  const box = $("existingOrgBox");
+  const sel = $("existingOrgSelect");
+  if (orgs.length > 0) {
+    sel.innerHTML = orgs.map((o) => `<option value="${o.org_id}">${o.name} (${o.org_id})</option>`).join("");
+    box.style.display = "block";
+  } else {
+    box.style.display = "none";
   }
 }
 
-$("orgSelect").addEventListener("change", async (e) => {
-  currentOrgId = e.target.value;
+$("openExistingOrgBtn").addEventListener("click", async () => {
+  const sel = $("existingOrgSelect");
+  if (!sel.value) return;
+  currentOrgId = sel.value;
   currentSessionId = null;
   await refreshOverview();
+  showWorkspaceView();
 });
 
 function activeDeviceForUser(userId) {
@@ -61,43 +72,15 @@ function activeDeviceForUser(userId) {
 async function refreshOverview() {
   if (!currentOrgId) return;
   currentOverview = await api(`/api/orgs/${currentOrgId}/overview`);
-  const activeKey = currentOverview.key_versions.find((k) => k.state === "ACTIVE");
-  $("keyBadge").textContent = activeKey ? `Key v${activeKey.version}` : "No Active Key";
+  currentResources = await api(`/api/orgs/${currentOrgId}/resources`);
 
-  // Nodes table
-  $("nodesTable").innerHTML = `<table><tr><th>Node</th><th>Service</th><th>Key Ver</th><th>Revoked Devices</th><th>Epoch</th></tr>${
-    currentOverview.nodes.map((n) =>
-      `<tr><td>${n.node_id}</td><td>${n.service_name}</td><td>v${n.active_key_version}</td><td>${n.revoked_devices.length}</td><td>${n.revocation_epoch}</td></tr>`
-    ).join("")
-  }</table>`;
+  renderUsersTable();
+  renderResourcesTable();
 
-  // Users & Devices table
-  $("usersTable").innerHTML = `<table><tr><th>Username</th><th>Identifier</th><th>Role</th><th>Status</th><th>Devices</th><th>Actions</th></tr>${
-    currentOverview.users.map((u) => {
-      const devs = currentOverview.devices.filter((d) => d.user_id === u.user_id);
-      const devHtml = devs.map((d) =>
-        `<div>${d.device_id} [${d.status}, v${d.key_version}] ${
-          d.status === "ACTIVE" ? `<button class="warn" onclick="revokeDevice('${d.device_id}')">Revoke</button>` : ""
-        }</div>`
-      ).join("");
-      return `<tr>
-        <td>${u.username} ${u.is_admin ? "(Admin)" : ""}</td>
-        <td>${u.identifier}</td>
-        <td>${u.role}</td>
-        <td>${u.quarantined ? "QUARANTINED" : "ACTIVE"}</td>
-        <td>${devHtml}</td>
-        <td>
-          <button class="secondary" onclick="reenrollUser('${u.user_id}')">Re-enroll</button>
-          <button class="secondary" onclick="promotePrompt('${u.user_id}')">Set Identifier</button>
-        </td>
-      </tr>`;
-    }).join("")
-  }</table>`;
-
-  // Populate user selectors
-  const selectors = ["accessActorSelect", "chatSenderSelect", "chatRecipientSelect"];
+  const selectors = ["chatSenderSelect", "chatRecipientSelect"];
   selectors.forEach((sid) => {
     const el = $(sid);
+    if (!el) return;
     const prev = el.value;
     el.innerHTML = currentOverview.users
       .map((u) => `<option value="${u.user_id}">${u.username} [${u.identifier}]</option>`)
@@ -105,8 +88,86 @@ async function refreshOverview() {
     if (prev && [...el.options].some((o) => o.value === prev)) el.value = prev;
   });
 
-  await Promise.all([loadResources(), loadMessages(), loadAudit(), loadAlerts()]);
+  await loadMessages();
 }
+
+function renderUsersTable() {
+  $("usersTable").innerHTML = `<table><tr><th>Username</th><th>Identifier</th><th>File Access</th><th>Actions</th></tr>${
+    currentOverview.users.map((u) => {
+      const fileChecks = currentResources.map((r) => {
+        const hasDirect = (r.allowed_users || []).includes(u.user_id);
+        const hasId = (r.allowed_identifiers || []).includes(u.identifier);
+        const checked = u.is_admin || hasDirect || hasId ? "checked" : "";
+        const disabled = u.is_admin ? "disabled" : "";
+        return `<label style="display:inline-flex;flex-direction:row;align-items:center;gap:6px;margin-right:10px;">
+          <input type="checkbox" ${checked} ${disabled} onchange="toggleFileAccess('${r.resource_id}','${u.user_id}',this.checked)" />
+          <span>${r.name}</span>
+        </label>`;
+      }).join("") || "<span class='muted'>No files</span>";
+
+      const actions = u.is_admin
+        ? "<span class='muted'>Admin</span>"
+        : `<button class="secondary" onclick="setIdentifierPrompt('${u.user_id}')">Set Identifier</button>
+           <button class="warn" onclick="removePerson('${u.user_id}')">Remove</button>`;
+
+      return `<tr>
+        <td>${u.username}</td>
+        <td>${u.identifier}</td>
+        <td>${fileChecks}</td>
+        <td>${actions}</td>
+      </tr>`;
+    }).join("")
+  }</table>`;
+}
+
+let ctxTargetResourceId = null;
+
+function renderResourcesTable() {
+  const fileSvg = `<svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>`;
+  const folderSvg = `<svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>`;
+
+  $("resourcesGrid").innerHTML = currentResources.map((r) => {
+    const icon = r.kind === "folder" ? folderSvg : fileSvg;
+    return `<div class="resource-item" onclick="accessResource('${r.resource_id}','${r.kind}')" oncontextmenu="openContextMenu(event,'${r.resource_id}')">
+      ${icon}
+      <div class="resource-name">${r.name}</div>
+    </div>`;
+  }).join("");
+}
+
+window.openContextMenu = (e, resourceId) => {
+  e.preventDefault();
+  ctxTargetResourceId = resourceId;
+  const menu = $("contextMenu");
+  menu.style.left = `${e.clientX}px`;
+  menu.style.top = `${e.clientY}px`;
+  menu.style.display = "flex";
+};
+
+document.addEventListener("click", () => {
+  const menu = $("contextMenu");
+  if (menu) menu.style.display = "none";
+});
+
+$("ctxRenameBtn").addEventListener("click", async () => {
+  if (!ctxTargetResourceId) return;
+  const current = currentResources.find((r) => r.resource_id === ctxTargetResourceId);
+  const newName = prompt("New name:", current ? current.name : "");
+  if (!newName || !newName.trim()) return;
+  try {
+    await api(`/api/orgs/${currentOrgId}/resources/${ctxTargetResourceId}/rename`, "PUT", {
+      actor_user_id: currentOverview.org.admin_user_id,
+      new_name: newName.trim(),
+    });
+    showToast("Renamed");
+    await refreshOverview();
+  } catch (err) { showToast(err.message, true); }
+});
+
+$("ctxDeleteBtn").addEventListener("click", async () => {
+  if (!ctxTargetResourceId) return;
+  await deleteFile(ctxTargetResourceId);
+});
 
 $("registerOrgForm").addEventListener("submit", async (e) => {
   e.preventDefault();
@@ -114,11 +175,14 @@ $("registerOrgForm").addEventListener("submit", async (e) => {
     const res = await api("/api/orgs", "POST", {
       org_name: $("orgName").value,
       admin_username: $("adminUsername").value,
-      admin_identifier: $("adminIdentifier").value,
+      admin_identifier: "admin",
     });
     currentOrgId = res.org_id;
+    currentSessionId = null;
+    $("registerOrgForm").reset();
     showToast(`Registered ${res.org_name}`);
-    await loadOrgs();
+    await refreshOverview();
+    showWorkspaceView();
   } catch (err) { showToast(err.message, true); }
 });
 
@@ -129,149 +193,126 @@ $("addUserForm").addEventListener("submit", async (e) => {
       admin_user_id: currentOverview.org.admin_user_id,
       username: $("newUsername").value,
       identifier: $("newIdentifier").value,
-      role: $("newRole").value,
-      approved_ticket: $("addTicket").value || null,
+      role: "member",
     });
-    showToast("Member added");
+    showToast("Person added");
     $("addUserForm").reset();
-    $("newRole").value = "member";
     await refreshOverview();
   } catch (err) { showToast(err.message, true); }
 });
 
-window.revokeDevice = async (deviceId) => {
+window.removePerson = async (userId) => {
   try {
-    const res = await api(`/api/orgs/${currentOrgId}/devices/${deviceId}/revoke`, "POST", {
-      actor_user_id: currentOverview.org.admin_user_id,
-      reason: "operator_revoke",
-    });
-    showToast(`Revoked across ${res.node_timings.length} nodes in ${res.propagation_to_last_node_ms} ms`);
+    const adminId = encodeURIComponent(currentOverview.org.admin_user_id);
+    await api(`/api/orgs/${currentOrgId}/users/${userId}?admin_user_id=${adminId}`, "DELETE");
+    showToast("Person removed");
     await refreshOverview();
   } catch (err) { showToast(err.message, true); }
 };
 
-window.reenrollUser = async (userId) => {
-  try {
-    const res = await api(`/api/orgs/${currentOrgId}/users/${userId}/reenroll`, "POST", {
-      actor_user_id: currentOverview.org.admin_user_id,
-    });
-    showToast(`Re-enrolled ${res.device_id}`);
-    await refreshOverview();
-  } catch (err) { showToast(err.message, true); }
-};
-
-window.promotePrompt = async (userId) => {
+window.setIdentifierPrompt = async (userId) => {
   const newId = prompt("New identifier:");
   if (!newId) return;
-  const ticket = prompt("Approved change ticket (leave blank for unapproved):") || null;
   try {
     await api(`/api/orgs/${currentOrgId}/users/${userId}/identifier`, "POST", {
       actor_user_id: currentOverview.org.admin_user_id,
       new_identifier: newId,
-      approved_ticket: ticket,
     });
     showToast(`Updated identifier to ${newId}`);
     await refreshOverview();
   } catch (err) { showToast(err.message, true); }
 };
 
-$("rotateKeyBtn").addEventListener("click", async () => {
+window.toggleFileAccess = async (resourceId, userId, grant) => {
   try {
-    const res = await api(`/api/orgs/${currentOrgId}/keys/rotate`, "POST", {
+    const res = currentResources.find((r) => r.resource_id === resourceId);
+    if (!res) return;
+    const allowedUsers = new Set(res.allowed_users || []);
+    if (grant) allowedUsers.add(userId);
+    else allowedUsers.delete(userId);
+
+    await api(`/api/orgs/${currentOrgId}/resources/${resourceId}/acl`, "PUT", {
       actor_user_id: currentOverview.org.admin_user_id,
-      grace_seconds: Number($("graceSeconds").value || 0),
+      allowed_identifiers: res.allowed_identifiers || [],
+      allowed_users: Array.from(allowedUsers),
     });
-    showToast(`Rotated to v${res.to_version}`);
+    showToast("File access updated");
     await refreshOverview();
   } catch (err) { showToast(err.message, true); }
+};
+
+$("addFileIconBtn").addEventListener("click", () => {
+  $("resFileInput").click();
 });
 
-$("crashRotateBtn").addEventListener("click", async () => {
-  try {
-    await api(`/api/orgs/${currentOrgId}/keys/rotate`, "POST", {
-      actor_user_id: currentOverview.org.admin_user_id,
-      simulate_crash_after_prepare: true,
-    });
-  } catch (err) {
-    showToast(`Crash simulated: ${err.message}`, true);
-    await refreshOverview();
-  }
-});
-
-$("recoverBtn").addEventListener("click", async () => {
-  try {
-    const res = await api(`/api/orgs/${currentOrgId}/keys/recover`, "POST", {
-      actor_user_id: currentOverview.org.admin_user_id,
-    });
-    showToast(`Recovered to v${res.active_key_version}`);
-    await refreshOverview();
-  } catch (err) { showToast(err.message, true); }
-});
-
-$("exportBackupBtn").addEventListener("click", async () => {
-  try {
-    const res = await api(`/api/orgs/${currentOrgId}/backup/export`, "POST", {
-      actor_user_id: currentOverview.org.admin_user_id,
-    });
-    $("backupBox").value = res.backup_b64;
-    showToast("Exported ML-DSA signed backup");
-  } catch (err) { showToast(err.message, true); }
-});
-
-$("verifyBackupBtn").addEventListener("click", async () => {
-  try {
-    const res = await api(`/api/orgs/${currentOrgId}/backup/verify`, "POST", {
-      actor_user_id: currentOverview.org.admin_user_id,
-      backup_b64: $("backupBox").value,
-    });
-    showToast(`Backup verified (${res.key_versions_restored} versions)`);
-  } catch (err) { showToast(err.message, true); }
-});
-
-async function loadResources() {
-  const list = await api(`/api/orgs/${currentOrgId}/resources`);
-  $("resourcesTable").innerHTML = `<table><tr><th>Name</th><th>Allowed Identifiers</th><th>Key Ver</th><th>Action</th></tr>${
-    list.map((r) =>
-      `<tr><td>${r.name}</td><td>${r.allowed_identifiers.join(", ")}</td><td>v${r.key_version}</td><td><button onclick="accessResource('${r.resource_id}')">Access</button></td></tr>`
-    ).join("")
-  }</table>`;
-}
-
-$("addResourceForm").addEventListener("submit", async (e) => {
-  e.preventDefault();
+$("resFileInput").addEventListener("change", async () => {
+  const file = $("resFileInput").files[0];
+  if (!file) return;
   try {
     const adminId = currentOverview.org.admin_user_id;
     const dev = activeDeviceForUser(adminId);
     if (!dev) throw new Error("No active admin device");
-    await api(`/api/orgs/${currentOrgId}/resources`, "POST", {
-      actor_user_id: adminId,
-      actor_device_id: dev.device_id,
-      name: $("resName").value,
-      content_text: $("resContent").value,
-      allowed_identifiers: $("resIdentifiers").value.split(",").map((s) => s.trim()).filter(Boolean),
-      allowed_users: $("resUsers").value.split(",").map((s) => s.trim()).filter(Boolean),
-    });
-    showToast("Resource encrypted & stored");
-    $("addResourceForm").reset();
+    const form = new FormData();
+    form.append("actor_user_id", adminId);
+    form.append("actor_device_id", dev.device_id);
+    form.append("allowed_identifiers", "admin");
+    form.append("allowed_users", "");
+    form.append("file", file);
+
+    const res = await fetch(`/api/orgs/${currentOrgId}/resources/upload`, { method: "POST", body: form });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.detail || `HTTP ${res.status}`);
+    showToast(`Added ${data.name}`);
+    $("resFileInput").value = "";
     await refreshOverview();
   } catch (err) { showToast(err.message, true); }
 });
 
-window.accessResource = async (resourceId) => {
+$("addFolderIconBtn").addEventListener("click", async () => {
+  const name = prompt("Folder name:");
+  if (!name || !name.trim()) return;
   try {
-    const actorId = $("accessActorSelect").value;
+    const adminId = currentOverview.org.admin_user_id;
+    const dev = activeDeviceForUser(adminId);
+    if (!dev) throw new Error("No active admin device");
+    await api(`/api/orgs/${currentOrgId}/folders`, "POST", {
+      actor_user_id: adminId,
+      actor_device_id: dev.device_id,
+      name: name.trim(),
+      allowed_identifiers: ["admin"],
+    });
+    showToast(`Created folder ${name.trim()}`);
+    await refreshOverview();
+  } catch (err) { showToast(err.message, true); }
+});
+
+window.deleteFile = async (resourceId) => {
+  try {
+    const actorId = encodeURIComponent(currentOverview.org.admin_user_id);
+    await api(`/api/orgs/${currentOrgId}/resources/${resourceId}?actor_user_id=${actorId}`, "DELETE");
+    showToast("Deleted");
+    await refreshOverview();
+  } catch (err) { showToast(err.message, true); }
+};
+
+window.accessResource = async (resourceId, kind = "file") => {
+  if (kind === "folder") return;
+  try {
+    const actorId = currentOverview.org.admin_user_id;
     const dev = activeDeviceForUser(actorId);
-    if (!dev) throw new Error("Selected user has no active device");
+    if (!dev) throw new Error("No active admin device");
     const res = await api(`/api/orgs/${currentOrgId}/resources/${resourceId}/access`, "POST", {
       actor_user_id: actorId,
       actor_device_id: dev.device_id,
     });
-    $("resourceOutput").textContent = JSON.stringify(res, null, 2);
+    const out = $("resourceOutput");
+    out.style.display = "block";
+    out.textContent = JSON.stringify(res, null, 2);
   } catch (err) {
-    $("resourceOutput").textContent = `DENIED: ${err.message}`;
+    const out = $("resourceOutput");
+    out.style.display = "block";
+    out.textContent = `DENIED: ${err.message}`;
     showToast(err.message, true);
-  } finally {
-    await Promise.all([loadAudit(), loadAlerts()]);
   }
 };
 
@@ -289,15 +330,15 @@ $("establishSessionBtn").addEventListener("click", async () => {
       peer_device_id: peerDev.device_id,
     });
     currentSessionId = res.session_id;
-    $("activeSessionInfo").textContent = `Session ${res.session_id} | Peer FP: ${res.peer_pk_fp}`;
-    showToast("PQC forward-secret session established");
+    $("activeSessionInfo").textContent = `Session ${res.session_id}`;
+    showToast("Session established");
   } catch (err) { showToast(err.message, true); }
 });
 
 $("sendChatForm").addEventListener("submit", async (e) => {
   e.preventDefault();
   try {
-    if (!currentSessionId) throw new Error("Establish a PQC session first");
+    if (!currentSessionId) throw new Error("Establish a session first");
     const senderId = $("chatSenderSelect").value;
     const recipientId = $("chatRecipientSelect").value;
     const sDev = activeDeviceForUser(senderId);
@@ -317,9 +358,9 @@ $("sendChatForm").addEventListener("submit", async (e) => {
 
 async function loadMessages() {
   const msgs = await api(`/api/orgs/${currentOrgId}/chat/messages`);
-  $("messagesTable").innerHTML = `<table><tr><th>Seq</th><th>From</th><th>To</th><th>Session</th><th>Action</th></tr>${
+  $("messagesTable").innerHTML = `<table><tr><th>Seq</th><th>From</th><th>To</th><th>Action</th></tr>${
     msgs.map((m) =>
-      `<tr><td>#${m.seq_no}</td><td>${m.sender_name}</td><td>${m.recipient_name}</td><td>${m.session_id}</td><td><button onclick="decryptMsg('${m.message_id}','${m.recipient_user_id}','${m.recipient_device_id}')">Decrypt</button></td></tr>`
+      `<tr><td>#${m.seq_no}</td><td>${m.sender_name}</td><td>${m.recipient_name}</td><td><button onclick="decryptMsg('${m.message_id}','${m.recipient_user_id}','${m.recipient_device_id}')">Decrypt</button></td></tr>`
     ).join("")
   }</table>`;
 }
@@ -336,45 +377,5 @@ window.decryptMsg = async (msgId, recvUserId, recvDevId) => {
     showToast(err.message, true);
   }
 };
-
-async function loadAudit() {
-  const logs = await api(`/api/orgs/${currentOrgId}/audit`);
-  $("auditTable").innerHTML = `<table><tr><th>Seq</th><th>Actor</th><th>Service</th><th>Action</th><th>Target</th><th>Hash</th></tr>${
-    logs.map((l) =>
-      `<tr><td>${l.seq}</td><td>${l.actor_id}</td><td>${l.service}</td><td>${l.action}</td><td>${l.target}</td><td>${l.entry_hash.slice(0, 14)}...</td></tr>`
-    ).join("")
-  }</table>`;
-}
-
-async function loadAlerts() {
-  const alerts = await api(`/api/orgs/${currentOrgId}/detector/alerts`);
-  $("alertsTable").innerHTML = `<table><tr><th>Severity</th><th>Rule</th><th>Identity</th><th>Services</th><th>Explanation</th><th>Response</th></tr>${
-    alerts.map((a) =>
-      `<tr><td>${a.severity}</td><td>${a.rule_name}</td><td>${a.identity}</td><td>${a.services.join(", ")}</td><td>${a.explanation}</td><td>${a.auto_response || "-"}</td></tr>`
-    ).join("")
-  }</table>`;
-}
-
-$("verifyChainBtn").addEventListener("click", async () => {
-  const res = await api(`/api/orgs/${currentOrgId}/audit/verify`);
-  $("securityOutput").textContent = JSON.stringify(res, null, 2);
-});
-
-$("scanAlertsBtn").addEventListener("click", async () => {
-  const res = await api(`/api/orgs/${currentOrgId}/detector/scan`, "POST", { auto_respond: false });
-  $("securityOutput").textContent = `Found ${res.length} alert(s)`;
-  await loadAlerts();
-});
-
-$("scanAutoRespondBtn").addEventListener("click", async () => {
-  const res = await api(`/api/orgs/${currentOrgId}/detector/scan`, "POST", { auto_respond: true });
-  $("securityOutput").textContent = `Scanned: ${res.length} alert(s) with auto-quarantine`;
-  await refreshOverview();
-});
-
-$("benchmarkBtn").addEventListener("click", async () => {
-  const res = await api("/api/detector/benchmark");
-  $("securityOutput").textContent = JSON.stringify(res, null, 2);
-});
 
 loadOrgs().catch((err) => showToast(err.message, true));
