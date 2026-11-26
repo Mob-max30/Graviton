@@ -417,6 +417,25 @@ class Node:
 
         return Decision("allow", ReasonCode.OK)
 
+    def check_actor(self, actor: str) -> Decision:
+        """Check whether an opaque actor is revoked without requiring device keys."""
+        if not isinstance(actor, str) or not actor:
+            return Decision("deny", ReasonCode.REVOKED_ACTOR)
+        with _state_lock(self.state_dir):
+            try:
+                state = self._load_raw_state()
+            except Exception:
+                return Decision("deny", ReasonCode.STATE_CORRUPT)
+            if not self._verify_state_integrity(state):
+                return Decision("deny", ReasonCode.STATE_CORRUPT)
+            if actor in state["revoked_actors"]:
+                return Decision("deny", ReasonCode.REVOKED_ACTOR)
+            if self.freshness_window is not None:
+                age = int(self._clock()) - int(state["last_issued_at"])
+                if age > self.freshness_window:
+                    return Decision("deny", ReasonCode.STALE_STATE)
+            return Decision("allow", ReasonCode.OK)
+
     def authorize(self, actor: str, device_id: str, key_version: int) -> Decision:
         """Make a fail-closed allow/deny decision from freshly loaded node state."""
         with _state_lock(self.state_dir):
