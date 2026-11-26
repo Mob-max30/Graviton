@@ -89,6 +89,19 @@ CREATE TABLE IF NOT EXISTS resources (
     aad BLOB NOT NULL,
     created_at REAL NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS chat_messages (
+    message_id TEXT PRIMARY KEY,
+    org_id TEXT NOT NULL REFERENCES organizations(org_id) ON DELETE CASCADE,
+    sender_user_id TEXT NOT NULL,
+    recipient_user_id TEXT NOT NULL,
+    session_id TEXT NOT NULL,
+    seq_no INTEGER NOT NULL,
+    nonce BLOB NOT NULL,
+    ciphertext BLOB NOT NULL,
+    aad BLOB NOT NULL,
+    created_at REAL NOT NULL
+);
 """
 
 
@@ -150,6 +163,16 @@ def _get_active_org(conn: sqlite3.Connection) -> dict[str, Any]:
     raise SystemExit(1)
 
 
+def _primary_machine_ip() -> str:
+    try:
+        ip = socket.gethostbyname(socket.gethostname())
+        if ip and not ip.startswith("127."):
+            return ip
+    except OSError:
+        pass
+    return "127.0.0.1"
+
+
 def _current_machine_ips() -> set[str]:
     ips = {"127.0.0.1", "::1"}
     try:
@@ -165,6 +188,28 @@ def _is_admin_ip(conn: sqlite3.Connection, org: dict[str, Any]) -> bool:
         (org["org_id"], org["admin_user_id"]),
     ).fetchone()
     return bool(row and row["device_ip"] in _current_machine_ips())
+
+
+def _current_user_for_org(conn: sqlite3.Connection, org: dict[str, Any]) -> sqlite3.Row | None:
+    """Resolve the user row matching this machine's IP (preferring non-loopback match)."""
+    ips = _current_machine_ips()
+    rows = conn.execute(
+        """
+        SELECT u.*, d.device_id, d.device_ip, d.dsa_pk, d.dsa_sk, d.ed_pk, d.ed_sk, d.fingerprint
+        FROM users u
+        JOIN devices d ON u.user_id = d.user_id AND d.status = 'ACTIVE'
+        WHERE u.org_id = ?
+        ORDER BY u.created_at ASC
+        """,
+        (org["org_id"],),
+    ).fetchall()
+    non_loopback = [r for r in rows if r["device_ip"] in ips and not r["device_ip"].startswith("127.")]
+    if len(non_loopback) == 1:
+        return non_loopback[0]
+    exact = [r for r in rows if r["device_ip"] in ips]
+    if len(exact) == 1:
+        return exact[0]
+    return None
 
 
 def check_device_reachable(ip_str: str) -> bool:
@@ -266,7 +311,7 @@ def cmd_register(company_name: str, admin_username: str | None = None) -> None:
             """,
             (admin_user_id, org_id, uname, now),
         )
-        _enroll_device_row(conn, org_id, admin_user_id, "127.0.0.1")
+        _enroll_device_row(conn, org_id, admin_user_id, _primary_machine_ip())
         conn.commit()
         org = dict(conn.execute("SELECT * FROM organizations WHERE org_id = ?", (org_id,)).fetchone())
 
@@ -288,11 +333,16 @@ def cmd_use(company_name: str) -> None:
             print(f"Organization not found: {company_name}")
             raise SystemExit(1)
         org = dict(row)
-        if not _is_admin_ip(conn, org):
-            print(f"Access denied: current device IP is not the admin IP for {org['name']}")
+        is_admin = _is_admin_ip(conn, org)
+        cur_user = _current_user_for_org(conn, org)
+        if not is_admin and cur_user is None:
+            print(f"Access denied: current device IP is not registered in {org['name']}")
             raise SystemExit(1)
     _set_active_org(org["org_id"])
-    print(f"({org['name']})")
+    if is_admin:
+        print(f"({org['name']})")
+    else:
+        print(f"({org['name']}:{cur_user['identifier']})")
 
 
 def _store_encrypted_resource(
@@ -537,7 +587,7 @@ def cmd_chat() -> None:
         org = _get_active_org(conn)
         users = conn.execute(
             """
-            SELECT u.user_id, u.username, u.identifier, d.*
+            SELECT u.user_id, u.username, u.identifier, u.is_admin, d.*
             FROM users u
             JOIN devices d ON u.user_id = d.user_id AND d.status = 'ACTIVE'
             WHERE u.org_id = ?
@@ -545,23 +595,40 @@ def cmd_chat() -> None:
             """,
             (org["org_id"],),
         ).fetchall()
+        cur_user = _current_user_for_org(conn, org)
 
     if len(users) < 2:
         print("Need at least 2 members to chat. Add people first with: gt -add-people")
         raise SystemExit(1)
 
-    print(f"\nMembers in {org['name']}:")
-    for idx, u in enumerate(users, start=1):
+    if cur_user is not None:
+        me = cur_user
+    else:
+        print(f"\nMembers in {org['name']}:")
+        for idx, u in enumerate(users, start=1):
+            print(f"  {idx}. {u['username']} [{u['identifier']}]")
+        me_idx = int(input("You are (number): ").strip()) - 1
+        if not (0 <= me_idx < len(users)):
+            print("Invalid member selection.")
+            raise SystemExit(1)
+        me = users[me_idx]
+
+    others = [u for u in users if u["user_id"] != me["user_id"]]
+    if not others:
+        print("No other members available to chat with.")
+        raise SystemExit(1)
+
+    print(f"\n[{org['name']}] Logged in as: {me['username']} [{me['identifier']}]")
+    print("Select member to chat with:")
+    for idx, u in enumerate(others, start=1):
         print(f"  {idx}. {u['username']} [{u['identifier']}]")
 
-    me_idx = int(input("You are (number): ").strip()) - 1
     peer_idx = int(input("Chat with (number): ").strip()) - 1
-    if not (0 <= me_idx < len(users)) or not (0 <= peer_idx < len(users)) or me_idx == peer_idx:
+    if not (0 <= peer_idx < len(others)):
         print("Invalid member selection.")
         raise SystemExit(1)
 
-    me = users[me_idx]
-    peer = users[peer_idx]
+    peer = others[peer_idx]
 
     me_kp = _load_keypair(me)
     peer_kp = _load_keypair(peer)
@@ -590,7 +657,7 @@ def cmd_chat() -> None:
         server_x25519_pk=s_x_pk,
         server_signature=s_sig,
     )
-    peer_keys = responder.complete_handshake(
+    responder.complete_handshake(
         client_identity_dsa_pk=me_kp.dsa_pk,
         client_identity_ed_pk=me_kp.ed_pk,
         client_signature=client_sig,
@@ -598,8 +665,33 @@ def cmd_chat() -> None:
 
     session_id = me_keys.session_id
     logger = _audit_logger(org)
-    print(f"\nEncrypted PQC chat started with {peer['username']} (type /quit to exit)\n")
+    chat_key = bytes(org["vault_key"])
+    print(f"\nEncrypted PQC chat started with {peer['username']} (type /refresh to read, /quit to exit)\n")
 
+    def _print_history(since_ts: float) -> float:
+        with _connect() as conn:
+            msgs = conn.execute(
+                """
+                SELECT * FROM chat_messages
+                WHERE org_id = ?
+                  AND ((sender_user_id = ? AND recipient_user_id = ?)
+                    OR (sender_user_id = ? AND recipient_user_id = ?))
+                  AND created_at > ?
+                ORDER BY created_at ASC
+                """,
+                (org["org_id"], me["user_id"], peer["user_id"], peer["user_id"], me["user_id"], since_ts),
+            ).fetchall()
+        last_ts = since_ts
+        for m in msgs:
+            pt = ChaCha20Poly1305(chat_key).decrypt(bytes(m["nonce"]), bytes(m["ciphertext"]), bytes(m["aad"])).decode("utf-8")
+            if m["sender_user_id"] == me["user_id"]:
+                print(f"{GREEN}[{me['username']}]: {pt}{RESET}")
+            else:
+                print(f"{WHITE}[{peer['username']}]: {pt}{RESET}")
+            last_ts = max(last_ts, float(m["created_at"]))
+        return last_ts
+
+    last_seen = _print_history(0.0)
     seq = 0
     while True:
         text = input("> ").strip()
@@ -607,8 +699,12 @@ def cmd_chat() -> None:
             continue
         if text == "/quit":
             break
+        if text == "/refresh":
+            last_seen = _print_history(last_seen)
+            continue
         seq += 1
-        nonce = seq.to_bytes(12, "big")
+        msg_id = f"msg_{uuid.uuid4().hex[:12]}"
+        nonce = secrets.token_bytes(12)
         aad = AssociatedData(
             protocol_version=1,
             suite_id=int(CipherSuite.SUITE_HYBRID),
@@ -618,21 +714,31 @@ def cmd_chat() -> None:
             recipient_epoch=1,
             session_id=session_id,
             sequence_number=seq,
-            message_id=f"msg_{seq}",
+            message_id=msg_id,
             chunk_index=0,
             chunk_count=1,
             total_length=len(text.encode("utf-8")),
         ).serialize()
 
-        ct = ChaCha20Poly1305(me_keys.send_key).encrypt(nonce, text.encode("utf-8"), aad)
-        print(f"{GREEN}[{me['username']}]: {text}{RESET}")
-        pt = ChaCha20Poly1305(peer_keys.recv_key).decrypt(nonce, ct, aad).decode("utf-8")
-        print(f"{WHITE}[{peer['username']} received]: {pt}{RESET}")
+        ct = ChaCha20Poly1305(chat_key).encrypt(nonce, text.encode("utf-8"), aad)
+        now = time.time()
+        with _connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO chat_messages (
+                    message_id, org_id, sender_user_id, recipient_user_id,
+                    session_id, seq_no, nonce, ciphertext, aad, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (msg_id, org["org_id"], me["user_id"], peer["user_id"], session_id, seq, nonce, ct, aad, now),
+            )
+            conn.commit()
+        last_seen = _print_history(last_seen)
         logger.append_entry(me["user_id"], "CHAT_SEND", peer["user_id"], "allow")
 
 
 def cmd_people() -> None:
-    """List all members, their positions, and their connected device IPs."""
+    """List members grouped by their identifier/position section along with their org and IP."""
     with _connect() as conn:
         org = _get_active_org(conn)
         if _is_admin_ip(conn, org):
@@ -643,7 +749,7 @@ def cmd_people() -> None:
             FROM users u
             JOIN devices d ON u.user_id = d.user_id
             WHERE u.org_id = ?
-            ORDER BY u.created_at ASC
+            ORDER BY u.is_admin DESC, u.identifier ASC, u.created_at ASC
             """,
             (org["org_id"],),
         ).fetchall()
@@ -651,9 +757,14 @@ def cmd_people() -> None:
     if not rows:
         print("No members found.")
         return
+    grouped: dict[str, list[sqlite3.Row]] = {}
     for r in rows:
-        role_tag = " [admin]" if r["is_admin"] else f" [{r['identifier']}]"
-        print(f"{r['username']}{role_tag} -> IP: {r['device_ip']} ({r['status']})")
+        grouped.setdefault(r["identifier"], []).append(r)
+
+    for ident, members in grouped.items():
+        print(f"[{ident}] ({org['name']})")
+        for m in members:
+            print(f"  - {m['username']} -> IP: {m['device_ip']} ({m['status']})")
 
 
 def cmd_prompt() -> None:

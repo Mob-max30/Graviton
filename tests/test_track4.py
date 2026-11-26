@@ -56,14 +56,15 @@ def test_gt_cli_integrated_with_trustledger(tmp_path: Path, monkeypatch, capsys)
 
     assert graviton_cli.main(["people"]) == 0
     people_out = capsys.readouterr().out
-    assert "finance - 1 [finance] -> IP: 127.0.0.1" in people_out
-    assert "finance - 2 [finance] -> IP: 127.0.0.1" in people_out
+    assert "[finance] (AcmeVault)" in people_out
+    assert "finance - 1 -> IP: 127.0.0.1" in people_out
+    assert "finance - 2 -> IP: 127.0.0.1" in people_out
 
     # 5. Unreachable / invalid IP rejected
     assert graviton_cli.check_device_reachable("not-an-ip") is False
 
-    # 6. gt -chat with TrustLedger HandshakeInitiator/HandshakeResponder + ChaCha20Poly1305
-    chat_inputs = iter(["1", "2", "hello trustledger", "/quit"])
+    # 6. gt -chat excludes self from peer list and persists encrypted messages
+    chat_inputs = iter(["1", "1", "hello trustledger", "/quit"])
     monkeypatch.setattr("builtins.input", lambda _="": next(chat_inputs))
     assert graviton_cli.main(["-chat"]) == 0
     chat_out = capsys.readouterr().out
