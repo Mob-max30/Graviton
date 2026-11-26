@@ -1,0 +1,24 @@
+{
+  "project": "Graviton",
+  "track": "Track 4: Trust, but verify",
+  "protected_assets": [
+    "End-to-end encrypted messages and session root keys",
+    "Long-term ML-DSA-65 / ML-KEM-768 identity keys and key backups",
+    "Append-only hash-chained audit log",
+    "Cluster node authorization and revocation state"
+  ],
+  "attackers": [
+    "Quantum-capable passive eavesdropper (harvest-now, decrypt-later)",
+    "Compromised or lost user device",
+    "Insider or lateral-movement attacker with valid credentials",
+    "Log-injection or backup-tampering attacker"
+  ],
+  "assumptions": [
+    "Clock skew across nodes is within +/-300 seconds",
+    "pqcrypto==0.4.0 ML-KEM-768 and ML-DSA-65 are available in the judging container"
+  ],
+  "limits": [
+    "Events with clock skew exceeding +/-300s are flagged as order_uncertain",
+    "Stdlib fallback in crypto.py is for local non-PQC environments only"
+  ]
+}
