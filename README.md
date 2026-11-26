@@ -4,6 +4,12 @@ Track 4 prototype protecting organization files and messages using vetted post-q
 
 ## Clean-Machine Setup & Terminal CLI
 
+### Ubuntu / Linux (one command after clone)
+```bash
+source setup.sh
+```
+
+### Manual / Windows
 ```bash
 python -m pip install -r requirements.txt
 python -m pip install --no-deps -e .
