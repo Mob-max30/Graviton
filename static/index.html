@@ -1,0 +1,139 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Graviton — PQC Identity, Storage & Chat</title>
+  <link rel="stylesheet" href="/static/styles.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">Graviton</div>
+    <div class="org-bar">
+      <select id="orgSelect"></select>
+      <span id="keyBadge" class="badge">No Org</span>
+    </div>
+  </header>
+
+  <nav class="tabs">
+    <button class="tab active" data-tab="org">Organization</button>
+    <button class="tab" data-tab="people">People & Keys</button>
+    <button class="tab" data-tab="resources">Resources</button>
+    <button class="tab" data-tab="chat">Org Chat</button>
+    <button class="tab" data-tab="security">Security & Audit</button>
+  </nav>
+
+  <main class="container">
+    <section id="tab-org" class="panel active">
+      <div class="card">
+        <h2>Register Organization</h2>
+        <form id="registerOrgForm" class="grid-form">
+          <label>Organization Name <input type="text" id="orgName" required /></label>
+          <label>Admin Username <input type="text" id="adminUsername" required /></label>
+          <label>Admin Identifier <input type="text" id="adminIdentifier" value="admin" required /></label>
+          <button type="submit">Register</button>
+        </form>
+      </div>
+      <div class="card">
+        <h2>Service Nodes</h2>
+        <div id="nodesTable"></div>
+      </div>
+    </section>
+
+    <section id="tab-people" class="panel">
+      <div class="card">
+        <h2>Add Member & Assign Identifier</h2>
+        <form id="addUserForm" class="grid-form">
+          <label>Username <input type="text" id="newUsername" required /></label>
+          <label>Identifier <input type="text" id="newIdentifier" required /></label>
+          <label>Role <input type="text" id="newRole" value="member" required /></label>
+          <label>Change Ticket (optional) <input type="text" id="addTicket" /></label>
+          <button type="submit">Add Person</button>
+        </form>
+      </div>
+      <div class="card">
+        <h2>Key Lifecycle & Backups</h2>
+        <div class="actions-row">
+          <label>Grace (s) <input type="number" id="graceSeconds" value="0" min="0" max="300" style="width:80px" /></label>
+          <button id="rotateKeyBtn">Rotate Org Key</button>
+          <button id="crashRotateBtn" class="warn">Simulate Crash Rotation</button>
+          <button id="recoverBtn">Recover Crash</button>
+          <button id="exportBackupBtn">Export Signed Backup</button>
+          <button id="verifyBackupBtn">Verify Backup</button>
+        </div>
+        <textarea id="backupBox" rows="3" placeholder="Signed backup envelope"></textarea>
+      </div>
+      <div class="card">
+        <h2>Members & Devices</h2>
+        <div id="usersTable"></div>
+      </div>
+    </section>
+
+    <section id="tab-resources" class="panel">
+      <div class="card">
+        <h2>Add Encrypted Resource</h2>
+        <form id="addResourceForm" class="grid-form">
+          <label>Resource Name <input type="text" id="resName" required /></label>
+          <label>Allowed Identifiers (comma-separated) <input type="text" id="resIdentifiers" required /></label>
+          <label>Allowed User IDs (comma-separated) <input type="text" id="resUsers" /></label>
+          <label class="full">Content <textarea id="resContent" rows="3" required></textarea></label>
+          <button type="submit">Encrypt & Store</button>
+        </form>
+      </div>
+      <div class="card">
+        <h2>Stored Resources</h2>
+        <div class="actions-row">
+          <label>Acting User <select id="accessActorSelect"></select></label>
+        </div>
+        <div id="resourcesTable"></div>
+        <pre id="resourceOutput" class="output"></pre>
+      </div>
+    </section>
+
+    <section id="tab-chat" class="panel">
+      <div class="card">
+        <h2>End-to-End Encrypted Chat (ML-KEM-768 + X25519 + ML-DSA-65)</h2>
+        <div class="grid-form">
+          <label>Sender <select id="chatSenderSelect"></select></label>
+          <label>Recipient <select id="chatRecipientSelect"></select></label>
+          <button id="establishSessionBtn" type="button">Establish PQC Session</button>
+        </div>
+        <div id="activeSessionInfo" class="muted"></div>
+        <form id="sendChatForm" class="grid-form" style="margin-top:12px">
+          <label class="full">Message <input type="text" id="chatPlaintext" required /></label>
+          <button type="submit">Send Encrypted</button>
+        </form>
+      </div>
+      <div class="card">
+        <h2>Messages</h2>
+        <div id="messagesTable"></div>
+        <pre id="chatOutput" class="output"></pre>
+      </div>
+    </section>
+
+    <section id="tab-security" class="panel">
+      <div class="card">
+        <h2>Audit Log Integrity & Explainable Detector</h2>
+        <div class="actions-row">
+          <button id="verifyChainBtn">Verify Hash & ML-DSA Chain</button>
+          <button id="scanAlertsBtn">Scan Logs</button>
+          <button id="scanAutoRespondBtn" class="warn">Scan + Auto-Quarantine</button>
+          <button id="benchmarkBtn">Run F1 Benchmark</button>
+        </div>
+        <pre id="securityOutput" class="output"></pre>
+      </div>
+      <div class="card">
+        <h2>Alerts</h2>
+        <div id="alertsTable"></div>
+      </div>
+      <div class="card">
+        <h2>Tamper-Evident Audit Log</h2>
+        <div id="auditTable"></div>
+      </div>
+    </section>
+  </main>
+
+  <div id="toast" class="toast"></div>
+  <script src="/static/app.js"></script>
+</body>
+</html>
