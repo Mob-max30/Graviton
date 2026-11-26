@@ -1,4 +1,1 @@
-{
-  "asset": "protected-resource",
-  "boundary": "identity-check"
-}
+{"asset":"protected-resource","boundary":"identity-check"}

@@ -2,14 +2,22 @@
 
 Track 4 prototype protecting organization files and messages using vetted post-quantum cryptography (`pqcrypto` ML-KEM-768 + ML-DSA-65) and hybrid X25519 + AES-256-GCM, paired with tamper-evident logging and a non-ML rule/graph detector.
 
-## Clean-Machine Setup & Run
+## Clean-Machine Setup & Terminal CLI
 
 ```bash
 python -m pip install -r requirements.txt
-python run.py
+python -m pip install --no-deps -e .
 ```
 
-Open `http://127.0.0.1:8000` in your browser.
+### Terminal Commands
+```bash
+gt -register <company-name>
+gt use <company-name>
+gt ls
+gt -add <file-or-folder-path>
+gt -add-people
+gt -chat
+```
 
 ## Run Verification Tests
 

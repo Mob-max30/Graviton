@@ -1,0 +1,78 @@
+[
+  {
+    "alert_id": "alert-priv-evt-008",
+    "rule_id": "R-PRIV-1",
+    "identity": "user-blair",
+    "services": [
+      "admin-console",
+      "identity"
+    ],
+    "event_ids": [
+      "evt-008"
+    ],
+    "severity": "HIGH",
+    "explanation": "Unexpected role change for actor user-blair from viewer to operator: No matching authorization exists in approvals; records do not prove cause or intent.",
+    "baseline_values_compared": {
+      "approval_id": null,
+      "found": false
+    },
+    "timestamps_with_uncertainty": {
+      "event_time": "2026-01-15T09:03:05.000Z"
+    },
+    "time_to_alert_ms": 1.2,
+    "candidate_sequence": false,
+    "quarantined": false
+  },
+  {
+    "alert_id": "alert-priv5-evt-009",
+    "rule_id": "R-PRIV-5",
+    "identity": "user-blair",
+    "services": [
+      "portal",
+      "reports"
+    ],
+    "event_ids": [
+      "evt-008",
+      "evt-009"
+    ],
+    "severity": "HIGH",
+    "explanation": "Review after role change: Allowed read follows unexpected role change in session sess-blair; records do not prove cause or intent.",
+    "baseline_values_compared": {
+      "unapproved_event_id": "evt-008"
+    },
+    "timestamps_with_uncertainty": {
+      "unapproved_event_time": "2026-01-15T09:03:05.000Z",
+      "read_event_time": "2026-01-15T09:03:06.000Z"
+    },
+    "time_to_alert_ms": 1.5,
+    "candidate_sequence": false,
+    "quarantined": false
+  },
+  {
+    "alert_id": "alert-lat-evt-012",
+    "rule_id": "R-LAT-2",
+    "identity": "svc-report-worker",
+    "services": [
+      "reports",
+      "billing",
+      "archive",
+      "identity"
+    ],
+    "event_ids": [
+      "evt-010",
+      "evt-011",
+      "evt-012"
+    ],
+    "severity": "MEDIUM",
+    "explanation": "Candidate lateral movement sequence: 3 unexpected denied service edges in flow flow-005. Does not indicate successful compromise.",
+    "baseline_values_compared": {
+      "observed_edge_count": 3
+    },
+    "timestamps_with_uncertainty": {
+      "latest_event_time": "2026-01-15T09:04:03.000Z"
+    },
+    "time_to_alert_ms": 1.8,
+    "candidate_sequence": true,
+    "quarantined": false
+  }
+]
