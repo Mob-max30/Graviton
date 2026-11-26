@@ -757,17 +757,17 @@ script.
                                                       verifies; tampering detected                   location is not also rewritten
  6  Routine vs           tests/test_detection_eval.py F1, median time to alert, false alerts per     Measured on deterministic 1,020-
     suspicious                                        1,000 benign events reported                   event dataset (seed=42)
- 7  Lateral movement     [test_lateral_movement]      Unusual path flagged with identity, services,  Depends on a correct allowed-edge
+ 7  Lateral movement     tests/test_lateral_movement.py Unusual path flagged with identity, services, Depends on a correct allowed-edge
                                                       events and rule/path                           graph
- 8  Clock differences    [test_clock_skew]            In-range skew/reorder handled; out-of-range    Supported range +/-[N]s,
-                                                      flagged "order uncertain"                      delay [M]s
- 9  Replay + recipient   [test_replay_binding]        Duplicates rejected; altered recipient         Replay cache retention = [value]
-    binding                                            rejected; only recipient reads
-10  Forward secrecy      [test_forward_secrecy]       Past sessions stay unreadable after long-term  Does not protect a session whose
+ 8  Clock differences    tests/test_clock_skew.py     In-range skew/reorder handled; out-of-range    Supported range +/-5s skew,
+                                                      flagged "order uncertain"                      10s arrival delay
+ 9  Replay + recipient   tests/test_replay_binding.py Duplicates rejected; altered recipient         Replay cache retention = 10,000
+    binding                                           rejected; only recipient reads                 counters/session (persisted)
+10  Forward secrecy      tests/test_forward_secrecy.py Past sessions stay unreadable after long-term Does not protect a session whose
                                                       key exposure                                   ephemeral keys were also leaked
-11  Delivery under       [test_lossy_delivery]        Complete messages delivered on recovery;       Retry limit = [value]
-    loss/reordering                                    incomplete discarded; failures reported
-12  Session resumption   [test_resumption]            Resume bound to peer; other identity with      Ticket lifetime = [value]
+11  Delivery under       tests/test_lossy_delivery.py Complete messages delivered on recovery;       Retry limit = 3 retries
+    loss/reordering                                   incomplete discarded; failures reported
+12  Session resumption   tests/test_resumption.py     Resume bound to peer; other identity with      Ticket lifetime = 3600s
                                                       same session ID rejected
 
 (Objectives 1 and 2 above bundle "revocation" and "device loss" because
