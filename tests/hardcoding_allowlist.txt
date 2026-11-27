@@ -1,0 +1,5 @@
+# Explicit allowlist for tests/test_no_hardcoding.py (only genuine public non-secret items).
+# Format: relative/path.py :: reason
+graviton/crypto/signatures.py :: Public ML-DSA-65 domain separation label
+graviton/comms/session.py :: Public HKDF info/domain labels (non-secret)
+graviton/adapter_store.py :: Public RFC 5869 HKDF info labels (non-secret)
