@@ -256,7 +256,8 @@ class TestAdapterWiring(unittest.TestCase):
             {"op": "read", "actor": "alice", "asset": "doc", "request_id": "r_new"},
             self.state_dir,
         )
-        self.assertEqual(res_new, {"decision": "allow", "body": "new-body"})
+        # Un-MAC'd / un-registered generation must fail closed with integrity_violation
+        self.assertEqual(res_new, {"error": "integrity_violation"})
 
     def test_08_concurrent_revokes_and_reads_no_deadlock(self) -> None:
         run_adapter(
