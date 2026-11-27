@@ -114,3 +114,80 @@ def test_remote_user_connect_orgs_and_chat(tmp_path: Path, monkeypatch, capsys):
         assert "hi alice" in capsys.readouterr().out
     finally:
         httpd.shutdown()
+
+
+def test_chat_isolation_no_overhearing(tmp_path: Path, monkeypatch):
+    import base64
+    import threading
+    from http.server import ThreadingHTTPServer
+    import pytest
+    from cryptography.exceptions import InvalidTag
+    from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
+    from trustledger.crypto.aead import AssociatedData
+    from trustledger.crypto.suites import CipherSuite
+
+    srv_data = tmp_path / "srv_iso"
+    monkeypatch.setenv("GRAVITON_DATA_DIR", str(srv_data))
+    monkeypatch.setenv("GRAVITON_DB_PATH", str(srv_data / "graviton.db"))
+    assert graviton_cli.main(["-register", "IsoCorp", "alice"]) == 0
+
+    monkeypatch.setattr(graviton_cli, "check_device_reachable", lambda _ip: True)
+    for ip in ("10.0.0.1", "10.0.0.2", "10.0.0.3"):
+        inputs = iter(["1", "dev", ip]) if ip == "10.0.0.1" else iter(["1", ip])
+        monkeypatch.setattr("builtins.input", lambda _="": next(inputs))
+        assert graviton_cli.main(["-add-people"]) == 0
+
+    with graviton_cli._connect() as conn:
+        org = conn.execute("SELECT org_id FROM organizations LIMIT 1").fetchone()
+        u1 = conn.execute("SELECT user_id FROM users WHERE username = 'dev - 1'").fetchone()["user_id"]
+        u2 = conn.execute("SELECT user_id FROM users WHERE username = 'dev - 2'").fetchone()["user_id"]
+        u3 = conn.execute("SELECT user_id FROM users WHERE username = 'dev - 3'").fetchone()["user_id"]
+
+    httpd = ThreadingHTTPServer(("127.0.0.1", 0), graviton_cli._make_server_handler(srv_data / "graviton.db"))
+    port = httpd.server_address[1]
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+
+    try:
+        # User 3 sends private message to User 1
+        cli3 = tmp_path / "cli3"
+        monkeypatch.setenv("GRAVITON_DATA_DIR", str(cli3))
+        monkeypatch.setattr(graviton_cli, "_primary_machine_ip", lambda: "10.0.0.3")
+        assert graviton_cli.main(["-connect", f"http://127.0.0.1:{port}"]) == 0
+
+        ses_31 = graviton_cli._remote_call("POST", "/api/chat/session", {"org_id": org["org_id"], "peer_id": u1})
+        key_31 = base64.b64decode(ses_31["session_key_b64"])
+        nonce = b"\x01" * 12
+        aad = AssociatedData(
+            1, int(CipherSuite.SUITE_HYBRID), u3, u1, ses_31["peer_fingerprint"], 1, ses_31["session_id"], 1, "m1", 0, 1, 13
+        ).serialize()
+        ct = ChaCha20Poly1305(key_31).encrypt(nonce, b"secret for u1", aad)
+        graviton_cli._remote_call(
+            "POST",
+            "/api/chat/send",
+            {
+                "org_id": org["org_id"],
+                "peer_id": u1,
+                "message_id": "m1",
+                "session_id": ses_31["session_id"],
+                "seq_no": 1,
+                "nonce_b64": base64.b64encode(nonce).decode("ascii"),
+                "ct_b64": base64.b64encode(ct).decode("ascii"),
+                "aad_b64": base64.b64encode(aad).decode("ascii"),
+            },
+        )
+
+        # User 2 chatting with User 1 receives ZERO messages from User 3 and CANNOT decrypt u3->u1 ciphertext
+        cli2 = tmp_path / "cli2"
+        monkeypatch.setenv("GRAVITON_DATA_DIR", str(cli2))
+        monkeypatch.setattr(graviton_cli, "_primary_machine_ip", lambda: "10.0.0.2")
+        assert graviton_cli.main(["-connect", f"http://127.0.0.1:{port}"]) == 0
+
+        msgs_for_u2 = graviton_cli._remote_call("GET", f"/api/chat/messages?org_id={org['org_id']}&peer_id={u1}&since=0")
+        assert msgs_for_u2 == []
+
+        ses_21 = graviton_cli._remote_call("POST", "/api/chat/session", {"org_id": org["org_id"], "peer_id": u1})
+        key_21 = base64.b64decode(ses_21["session_key_b64"])
+        with pytest.raises(InvalidTag):
+            ChaCha20Poly1305(key_21).decrypt(nonce, ct, aad)
+    finally:
+        httpd.shutdown()

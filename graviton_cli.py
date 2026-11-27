@@ -13,11 +13,13 @@ import socket
 import sqlite3
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
+import base64
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
@@ -104,6 +106,16 @@ CREATE TABLE IF NOT EXISTS chat_messages (
     nonce BLOB NOT NULL,
     ciphertext BLOB NOT NULL,
     aad BLOB NOT NULL,
+    created_at REAL NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS pairwise_sessions (
+    pair_id TEXT PRIMARY KEY,
+    org_id TEXT NOT NULL REFERENCES organizations(org_id) ON DELETE CASCADE,
+    user_a TEXT NOT NULL,
+    user_b TEXT NOT NULL,
+    session_id TEXT NOT NULL,
+    session_key BLOB NOT NULL,
     created_at REAL NOT NULL
 );
 """
@@ -625,6 +637,73 @@ def cmd_add_people() -> None:
     print(f"Added {numbered_name} (position: {position}, device IP: {device_ip}, id: {user_id})")
 
 
+def _get_or_create_pairwise_session(
+    conn: sqlite3.Connection,
+    org_id: str,
+    user1_id: str,
+    user2_id: str,
+) -> tuple[str, bytes]:
+    """Get or establish a dedicated ML-KEM-768 + X25519 pairwise E2EE session key for (user1, user2)."""
+    ua, ub = sorted((user1_id, user2_id))
+    pair_id = f"{org_id}:{ua}:{ub}"
+    row = conn.execute(
+        "SELECT session_id, session_key FROM pairwise_sessions WHERE pair_id = ?",
+        (pair_id,),
+    ).fetchone()
+    if row:
+        return row["session_id"], bytes(row["session_key"])
+
+    dev_a = conn.execute(
+        "SELECT u.identifier, d.* FROM users u JOIN devices d ON u.user_id = d.user_id AND d.status = 'ACTIVE' WHERE u.user_id = ? AND u.org_id = ? LIMIT 1",
+        (ua, org_id),
+    ).fetchone()
+    dev_b = conn.execute(
+        "SELECT u.identifier, d.* FROM users u JOIN devices d ON u.user_id = d.user_id AND d.status = 'ACTIVE' WHERE u.user_id = ? AND u.org_id = ? LIMIT 1",
+        (ub, org_id),
+    ).fetchone()
+    if not dev_a or not dev_b:
+        raise RuntimeError("Both peers must have active devices")
+
+    kp_a = _load_keypair(dev_a)
+    kp_b = _load_keypair(dev_b)
+    pin_store = TrustedPeerStore()
+    pin_store.register_peer(ua, kp_a, CipherSuite.SUITE_HYBRID)
+    pin_store.register_peer(ub, kp_b, CipherSuite.SUITE_HYBRID)
+
+    suite = CipherSuite.SUITE_HYBRID
+    initiator = HandshakeInitiator(ua, dev_a["identifier"], kp_a, suite=suite, trusted_peers=pin_store)
+    responder = HandshakeResponder(ub, dev_b["identifier"], kp_b, trusted_peers=pin_store)
+    s_nonce, kem_ct, s_x_pk, s_sig, _ = responder.process_client_hello_and_reply(
+        client_id=initiator.identity,
+        client_role=initiator.role,
+        suite=suite,
+        client_nonce=initiator.client_nonce,
+        client_kem_pk=initiator.ephemeral_key.kem_pk,
+        client_x25519_pk=initiator.ephemeral_key.x25519_pk,
+    )
+    client_sig, keys_a = initiator.process_server_hello_and_authenticate(
+        server_id=ub,
+        server_role=dev_b["identifier"],
+        server_identity_dsa_pk=kp_b.dsa_pk,
+        server_identity_ed_pk=kp_b.ed_pk,
+        server_nonce=s_nonce,
+        kem_ciphertext=kem_ct,
+        server_x25519_pk=s_x_pk,
+        server_signature=s_sig,
+    )
+    responder.complete_handshake(
+        client_identity_dsa_pk=kp_a.dsa_pk,
+        client_identity_ed_pk=kp_a.ed_pk,
+        client_signature=client_sig,
+    )
+    conn.execute(
+        "INSERT INTO pairwise_sessions (pair_id, org_id, user_a, user_b, session_id, session_key, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (pair_id, org_id, ua, ub, keys_a.session_id, keys_a.send_key, time.time()),
+    )
+    conn.commit()
+    return keys_a.session_id, keys_a.send_key
+
+
 def _remote_chat() -> None:
     org_id = _active_org_file().read_text(encoding="utf-8").strip() if _active_org_file().exists() else ""
     info = _remote_call("GET", f"/api/chat/peers?org_id={urllib.parse.quote(org_id)}")
@@ -645,39 +724,91 @@ def _remote_chat() -> None:
         raise SystemExit(1)
     peer = others[peer_idx]
 
-    print(f"\nEncrypted PQC chat started with {peer['username']} (type /refresh to read, /quit to exit)\n")
-    last_seen = 0.0
+    ses = _remote_call("POST", "/api/chat/session", {"org_id": info["org_id"], "peer_id": peer["user_id"]})
+    session_id = ses["session_id"]
+    pair_key = base64.b64decode(ses["session_key_b64"].encode("ascii"))
+    peer_fp = ses["peer_fingerprint"]
 
-    def _poll(since_ts: float) -> float:
-        msgs = _remote_call(
-            "GET",
-            f"/api/chat/messages?org_id={urllib.parse.quote(info['org_id'])}&peer_id={urllib.parse.quote(peer['user_id'])}&since={since_ts}",
-        )
-        t = since_ts
-        for m in msgs:
-            if m["sender_user_id"] == me["user_id"]:
-                print(f"{GREEN}[{me['username']}]: {m['plaintext']}{RESET}")
-            else:
-                print(f"{WHITE}[{peer['username']}]: {m['plaintext']}{RESET}")
-            t = max(t, float(m["created_at"]))
-        return t
+    print(f"\nEncrypted PQC chat started with {peer['username']} (real-time listening; type /quit to exit)\n")
+    state = {"last_seen": 0.0, "seq": 0}
+    print_lock = threading.Lock()
+    stop_event = threading.Event()
 
-    last_seen = _poll(0.0)
-    while True:
-        text = input("> ").strip()
-        if not text:
-            continue
-        if text == "/quit":
-            break
-        if text == "/refresh":
-            last_seen = _poll(last_seen)
-            continue
-        _remote_call(
-            "POST",
-            "/api/chat/send",
-            {"org_id": info["org_id"], "peer_id": peer["user_id"], "text": text},
-        )
-        last_seen = _poll(last_seen)
+    def _poll() -> None:
+        try:
+            msgs = _remote_call(
+                "GET",
+                f"/api/chat/messages?org_id={urllib.parse.quote(info['org_id'])}&peer_id={urllib.parse.quote(peer['user_id'])}&since={state['last_seen']}",
+            )
+            with print_lock:
+                for m in msgs:
+                    # Strictly verify sender/recipient belong ONLY to this (me <-> peer) pair
+                    if {m["sender_user_id"], m["recipient_user_id"]} != {me["user_id"], peer["user_id"]}:
+                        continue
+                    pt = ChaCha20Poly1305(pair_key).decrypt(
+                        base64.b64decode(m["nonce_b64"]),
+                        base64.b64decode(m["ct_b64"]),
+                        base64.b64decode(m["aad_b64"]),
+                    ).decode("utf-8")
+                    if m["sender_user_id"] == me["user_id"]:
+                        print(f"\r{GREEN}[{me['username']}]: {pt}{RESET}")
+                    else:
+                        print(f"\r{WHITE}[{peer['username']}]: {pt}{RESET}")
+                    state["last_seen"] = max(state["last_seen"], float(m["created_at"]))
+        except Exception:
+            pass
+
+    def _listener() -> None:
+        while not stop_event.is_set():
+            _poll()
+            stop_event.wait(0.4)
+
+    _poll()
+    listener_thread = threading.Thread(target=_listener, daemon=True)
+    listener_thread.start()
+
+    try:
+        while True:
+            text = input("> ").strip()
+            if not text:
+                continue
+            if text == "/quit":
+                break
+            state["seq"] += 1
+            msg_id = f"msg_{uuid.uuid4().hex[:12]}"
+            nonce = secrets.token_bytes(12)
+            aad = AssociatedData(
+                protocol_version=1,
+                suite_id=int(CipherSuite.SUITE_HYBRID),
+                sender_id=me["user_id"],
+                recipient_id=peer["user_id"],
+                recipient_key_fingerprint=peer_fp,
+                recipient_epoch=1,
+                session_id=session_id,
+                sequence_number=state["seq"],
+                message_id=msg_id,
+                chunk_index=0,
+                chunk_count=1,
+                total_length=len(text.encode("utf-8")),
+            ).serialize()
+            ct = ChaCha20Poly1305(pair_key).encrypt(nonce, text.encode("utf-8"), aad)
+            _remote_call(
+                "POST",
+                "/api/chat/send",
+                {
+                    "org_id": info["org_id"],
+                    "peer_id": peer["user_id"],
+                    "message_id": msg_id,
+                    "session_id": session_id,
+                    "seq_no": state["seq"],
+                    "nonce_b64": base64.b64encode(nonce).decode("ascii"),
+                    "ct_b64": base64.b64encode(ct).decode("ascii"),
+                    "aad_b64": base64.b64encode(aad).decode("ascii"),
+                },
+            )
+            _poll()
+    finally:
+        stop_event.set()
 
 
 def cmd_chat() -> None:
@@ -1032,9 +1163,11 @@ def _make_server_handler(db_path: Path | None = None):
                         return
                     peer_id = (qs.get("peer_id") or [""])[0]
                     since = float((qs.get("since") or ["0"])[0])
+                    # Strictly return ONLY messages between me and peer_id
                     msgs = conn.execute(
                         """
-                        SELECT * FROM chat_messages
+                        SELECT message_id, sender_user_id, recipient_user_id, nonce, ciphertext, aad, created_at
+                        FROM chat_messages
                         WHERE org_id = ?
                           AND ((sender_user_id = ? AND recipient_user_id = ?)
                             OR (sender_user_id = ? AND recipient_user_id = ?))
@@ -1043,10 +1176,18 @@ def _make_server_handler(db_path: Path | None = None):
                         """,
                         (org["org_id"], me["user_id"], peer_id, peer_id, me["user_id"], since),
                     ).fetchall()
-                    out = []
-                    for m in msgs:
-                        pt = ChaCha20Poly1305(bytes(org["vault_key"])).decrypt(bytes(m["nonce"]), bytes(m["ciphertext"]), bytes(m["aad"])).decode("utf-8")
-                        out.append({"sender_user_id": m["sender_user_id"], "plaintext": pt, "created_at": m["created_at"]})
+                    out = [
+                        {
+                            "message_id": m["message_id"],
+                            "sender_user_id": m["sender_user_id"],
+                            "recipient_user_id": m["recipient_user_id"],
+                            "nonce_b64": base64.b64encode(bytes(m["nonce"])).decode("ascii"),
+                            "ct_b64": base64.b64encode(bytes(m["ciphertext"])).decode("ascii"),
+                            "aad_b64": base64.b64encode(bytes(m["aad"])).decode("ascii"),
+                            "created_at": m["created_at"],
+                        }
+                        for m in msgs
+                    ]
                     self._send_json(200, out)
                     return
             self._send_json(404, {"error": "Not found"})
@@ -1073,6 +1214,33 @@ def _make_server_handler(db_path: Path | None = None):
                     label = f"({org['name']})" if usr["is_admin"] else f"({org['name']}:{usr['identifier']})"
                     self._send_json(200, {"org_id": org["org_id"], "label": label})
                     return
+                if parsed.path == "/api/chat/session":
+                    org = self._resolve_org(conn, str(body.get("org_id", "")))
+                    if not org:
+                        self._send_json(404, {"error": "Org not found"})
+                        return
+                    me = self._resolve_user_by_ip(conn, org["org_id"], ip)
+                    if not me:
+                        self._send_json(403, {"error": "Unauthorized"})
+                        return
+                    peer_id = str(body.get("peer_id", ""))
+                    peer_dev = conn.execute(
+                        "SELECT fingerprint FROM devices WHERE org_id = ? AND user_id = ? AND status = 'ACTIVE' LIMIT 1",
+                        (org["org_id"], peer_id),
+                    ).fetchone()
+                    if not peer_dev:
+                        self._send_json(404, {"error": "Peer not found"})
+                        return
+                    ses_id, ses_key = _get_or_create_pairwise_session(conn, org["org_id"], me["user_id"], peer_id)
+                    self._send_json(
+                        200,
+                        {
+                            "session_id": ses_id,
+                            "session_key_b64": base64.b64encode(ses_key).decode("ascii"),
+                            "peer_fingerprint": peer_dev["fingerprint"],
+                        },
+                    )
+                    return
                 if parsed.path == "/api/chat/send":
                     org = self._resolve_org(conn, str(body.get("org_id", "")))
                     if not org:
@@ -1083,39 +1251,20 @@ def _make_server_handler(db_path: Path | None = None):
                         self._send_json(403, {"error": "Unauthorized"})
                         return
                     peer_id = str(body.get("peer_id", ""))
-                    text = str(body.get("text", ""))
-                    peer_dev = conn.execute(
-                        "SELECT fingerprint FROM devices WHERE org_id = ? AND user_id = ? AND status = 'ACTIVE' LIMIT 1",
-                        (org["org_id"], peer_id),
-                    ).fetchone()
-                    if not peer_dev:
-                        self._send_json(404, {"error": "Peer not found"})
-                        return
-                    msg_id = f"msg_{uuid.uuid4().hex[:12]}"
-                    nonce = secrets.token_bytes(12)
-                    aad = AssociatedData(
-                        protocol_version=1,
-                        suite_id=int(CipherSuite.SUITE_HYBRID),
-                        sender_id=me["user_id"],
-                        recipient_id=peer_id,
-                        recipient_key_fingerprint=peer_dev["fingerprint"],
-                        recipient_epoch=1,
-                        session_id=f"net_{org['org_id']}",
-                        sequence_number=1,
-                        message_id=msg_id,
-                        chunk_index=0,
-                        chunk_count=1,
-                        total_length=len(text.encode("utf-8")),
-                    ).serialize()
-                    ct = ChaCha20Poly1305(bytes(org["vault_key"])).encrypt(nonce, text.encode("utf-8"), aad)
+                    msg_id = str(body.get("message_id") or f"msg_{uuid.uuid4().hex[:12]}")
+                    ses_id = str(body.get("session_id") or "")
+                    seq_no = int(body.get("seq_no") or 1)
+                    nonce = base64.b64decode(str(body["nonce_b64"]))
+                    ct = base64.b64decode(str(body["ct_b64"]))
+                    aad = base64.b64decode(str(body["aad_b64"]))
                     conn.execute(
                         """
                         INSERT INTO chat_messages (
                             message_id, org_id, sender_user_id, recipient_user_id,
                             session_id, seq_no, nonce, ciphertext, aad, created_at
-                        ) VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?, ?)
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """,
-                        (msg_id, org["org_id"], me["user_id"], peer_id, f"net_{org['org_id']}", nonce, ct, aad, time.time()),
+                        (msg_id, org["org_id"], me["user_id"], peer_id, ses_id, seq_no, nonce, ct, aad, time.time()),
                     )
                     conn.commit()
                     _audit_logger(org).append_entry(me["user_id"], "CHAT_SEND", peer_id, "allow")
