@@ -85,8 +85,8 @@ class DetectionEngine:
         unexpected_edge_chains: dict[tuple[str, str], list[NormalizedEvent]] = {}
 
         for ev in ordered:
-            # Rule 1: Privilege increase / role change without valid approval
-            if ev.action == "role_change" and ev.role_before != ev.role_after:
+            # Rule 1: Privilege increase / role change without valid approval (principled: any role transition)
+            if ev.role_before and ev.role_after and ev.role_before != ev.role_after:
                 if not self._is_approved_role_change(ev):
                     suspicious_priv_sessions[ev.session_id] = ev
                     alerts.append(

@@ -150,7 +150,8 @@ def main(argv: list[str] | None = None) -> int:
     p_bak.add_argument("--pubkey-b64", required=True)
     p_bak.add_argument("--min-version", type=int, default=1)
 
-    sub.add_parser("detect-eval", help="Run deterministic detection evaluation")
+    p_deval = sub.add_parser("detect-eval", help="Run deterministic detection evaluation")
+    p_deval.add_argument("--out", type=Path, default=None, help="Write full metrics JSON to file")
     sub.add_parser("bench", help="Run unified benchmark suite")
 
     p_sent = sub.add_parser("sentinel", help="Run live security sentinel")
@@ -460,8 +461,46 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.command == "detect-eval":
+        import json as _json
+        from graviton.detect.heldout import evaluate_heldout_families
+
         m = evaluate_detection()
-        print(f"F1={m['f1']} median_tta_ms={m['median_time_to_alert_ms']} false_alerts/1k={m['false_alerts_per_1000_benign']}")
+        ho = evaluate_heldout_families(seeds=10)
+        # Practice dataset evaluation if vendored
+        practice_metrics: dict | None = None
+        practice_dir = Path("fixtures/practice")
+        if (practice_dir / "events.csv").is_file():
+            import csv as _csv
+            from graviton.detect.engine import DEFAULT_ALLOWED_EDGES, DetectionEngine
+
+            with (practice_dir / "events.csv").open("r", encoding="utf-8") as fh:
+                evs = list(_csv.DictReader(fh))
+            apps = _json.loads((practice_dir / "approvals.json").read_text(encoding="utf-8"))["changes"]
+            with (practice_dir / "labels.csv").open("r", encoding="utf-8") as fh:
+                lbls = {r["event_id"]: r["label"] for r in _csv.DictReader(fh)}
+            pos_lbls = {"unexpected_role_change", "review_after_role_change", "lateral_movement_candidate"}
+            pos_ids = {k for k, v in lbls.items() if v in pos_lbls}
+            _, pals = DetectionEngine(allowed_edges=DEFAULT_ALLOWED_EDGES, approvals=apps).analyze(evs)
+            a_ids = {eid for al in pals for eid in al.event_ids}
+            tp, fp, fn = len(a_ids & pos_ids), len(a_ids - pos_ids), len(pos_ids - a_ids)
+            pr = tp / (tp + fp) if (tp + fp) else 1.0
+            rc = tp / (tp + fn) if (tp + fn) else 1.0
+            f1 = (2 * pr * rc / (pr + rc)) if (pr + rc) else 0.0
+            practice_metrics = {
+                "precision": round(pr, 4),
+                "recall": round(rc, 4),
+                "f1": round(f1, 4),
+                "false_alerts_per_1000_benign": round((fp / max(1, len(lbls) - len(pos_ids))) * 1000.0, 4),
+            }
+        full = {"synthetic_eval": m, "heldout_10_seeds": ho, "practice": practice_metrics}
+        if args.out is not None:
+            args.out.parent.mkdir(parents=True, exist_ok=True)
+            args.out.write_text(_json.dumps(full, indent=2), encoding="utf-8")
+        print(
+            f"F1={m['f1']} median_tta_ms={m['median_time_to_alert_ms']} "
+            f"false_alerts/1k={m['false_alerts_per_1000_benign']} "
+            f"heldout_mean_f1={ho['mean_attack_f1']}"
+        )
         return 0
 
     if args.command == "bench":
