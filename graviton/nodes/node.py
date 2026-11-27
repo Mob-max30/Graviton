@@ -303,6 +303,38 @@ class Node:
             state = self._load_raw_state()
             return int(state["applied_epoch"])
 
+    def get_trust_root(self) -> tuple[str, bytes]:
+        """Return (feed_id, admin_public_key) from persisted node state."""
+        with _state_lock(self.state_dir):
+            state = self._load_raw_state()
+            return state["feed_id"], base64.b64decode(state["admin_public_key_b64"], validate=True)
+
+    def entries_after(self, since_epoch: int) -> list[bytes]:
+        """Return raw serialized feed entries with epoch > since_epoch."""
+        if since_epoch < 0:
+            raise ValueError("since_epoch must be non-negative")
+        with _state_lock(self.state_dir):
+            state = self._load_raw_state()
+            return [base64.b64decode(b, validate=True) for b in state["applied_entries"][since_epoch:]]
+
+    def get_device_public_key(self, actor: str, device_id: str, key_version: int) -> bytes | None:
+        """Return registered ML-DSA-65 public key for exact (actor, device_id, key_version)."""
+        with _state_lock(self.state_dir):
+            try:
+                state = self._load_raw_state()
+            except Exception:
+                return None
+            ver_info = (
+                state.get("registry", {})
+                .get(actor, {})
+                .get(device_id, {})
+                .get("versions", {})
+                .get(str(key_version))
+            )
+            if not isinstance(ver_info, dict) or "public_key_b64" not in ver_info:
+                return None
+            return base64.b64decode(ver_info["public_key_b64"], validate=True)
+
     def apply_entry(self, raw_bytes: bytes) -> ApplyResult:
         """Verify and atomically apply one serialized feed entry."""
         if not isinstance(raw_bytes, (bytes, bytearray)) or len(raw_bytes) > MAX_ENTRY_LEN:
