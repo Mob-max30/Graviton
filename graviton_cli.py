@@ -1039,7 +1039,12 @@ def cmd_orgs() -> None:
 def cmd_connect(server_target: str) -> None:
     """Connect this user device to the admin Graviton server IP."""
     target = server_target.strip()
-    url = target if target.startswith("http") else f"http://{target}:8765"
+    if target.startswith("http"):
+        url = target
+    elif ":" in target:
+        url = f"http://{target}"
+    else:
+        url = f"http://{target}:8765"
     _server_url_file().write_text(url, encoding="utf-8")
     try:
         res = _remote_call("GET", "/api/health")
