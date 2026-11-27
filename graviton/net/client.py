@@ -55,7 +55,7 @@ class NodeClient:
         port: int,
         *,
         expected_node_pk: bytes | None = None,
-        timeout: float = 5.0,
+        timeout: float = 15.0,
         max_frame_bytes: int = DEFAULT_MAX_FRAME_BYTES,
         tls_ca: str | None = None,
     ) -> None:
