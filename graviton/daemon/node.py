@@ -26,10 +26,16 @@ from graviton.net.protocol import (
     MSG_FEED_PUSH,
     MSG_JOIN_REQUEST,
     MSG_REQUEST,
+    OP_ACK,
     OP_FEED_PULL,
+    OP_FETCH_ENVELOPE,
+    OP_GET_CHUNK,
     OP_INVITE_CREATE,
     OP_JOIN_LIST,
     OP_JOIN_RESOLVE,
+    OP_LIST_INBOX,
+    OP_PUT_CHUNK,
+    OP_PUT_ENVELOPE,
     OP_STATUS,
     PROTO_VERSION,
     REQUEST_SIGN_DOMAIN,
@@ -64,6 +70,10 @@ DEFAULT_READ_TIMEOUT_S = 5.0
 DEFAULT_IDLE_TIMEOUT_S = 30.0
 DEFAULT_SOURCE_RATE = (600, 10.0)    # 600 requests per 10s per source IP
 DEFAULT_IDENTITY_RATE = (600, 10.0)  # 600 requests per 10s per identity
+MAX_ENVELOPES_PER_USER = 500
+MAX_STORAGE_BYTES_PER_USER = 10_485_760  # 10 MiB
+DEFAULT_ENVELOPE_TTL_S = 3600
+MAX_ENVELOPE_TTL_S = 7 * 86400
 
 
 class _RateLimiter:
@@ -137,6 +147,8 @@ class NodeDaemon:
         ready_file: str | Path | None = None,
         upstream: tuple[str, int] | None = None,
         sync_interval_s: float = 1.0,
+        max_envelopes_per_user: int = MAX_ENVELOPES_PER_USER,
+        max_storage_bytes_per_user: int = MAX_STORAGE_BYTES_PER_USER,
     ) -> None:
         self.node_dir = Path(node_dir)
         self.host = host
@@ -149,6 +161,8 @@ class NodeDaemon:
         self.ready_file = Path(ready_file) if ready_file else None
         self.upstream = upstream
         self.sync_interval_s = sync_interval_s
+        self.max_envelopes_per_user = max_envelopes_per_user
+        self.max_storage_bytes_per_user = max_storage_bytes_per_user
 
         if host not in ("127.0.0.1", "::1", "localhost"):
             print(
@@ -203,8 +217,46 @@ class NodeDaemon:
                     received_at INTEGER NOT NULL,
                     status TEXT NOT NULL DEFAULT 'PENDING'
                 );
+                CREATE TABLE IF NOT EXISTS relay_envelopes (
+                    envelope_id TEXT PRIMARY KEY,
+                    sender TEXT NOT NULL,
+                    recipient TEXT NOT NULL,
+                    payload_json TEXT NOT NULL,
+                    size_bytes INTEGER NOT NULL,
+                    created_at INTEGER NOT NULL,
+                    expires_at INTEGER NOT NULL,
+                    burn_after_read INTEGER NOT NULL DEFAULT 0
+                );
+                CREATE INDEX IF NOT EXISTS idx_relay_recipient ON relay_envelopes(recipient, expires_at);
+                CREATE TABLE IF NOT EXISTS vault_chunks (
+                    chunk_key TEXT PRIMARY KEY,
+                    owner TEXT NOT NULL,
+                    recipient TEXT NOT NULL,
+                    payload_json TEXT NOT NULL,
+                    size_bytes INTEGER NOT NULL,
+                    created_at INTEGER NOT NULL,
+                    expires_at INTEGER NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_vault_recipient ON vault_chunks(recipient, expires_at);
                 """
             )
+
+    @staticmethod
+    def _purge_expired(conn: sqlite3.Connection, now: int) -> None:
+        conn.execute("DELETE FROM relay_envelopes WHERE expires_at <= ?", (now,))
+        conn.execute("DELETE FROM vault_chunks WHERE expires_at <= ?", (now,))
+
+    @staticmethod
+    def _user_quota_usage(conn: sqlite3.Connection, user: str) -> tuple[int, int]:
+        row1 = conn.execute(
+            "SELECT COUNT(*), COALESCE(SUM(size_bytes), 0) FROM relay_envelopes WHERE recipient = ?",
+            (user,),
+        ).fetchone()
+        row2 = conn.execute(
+            "SELECT COALESCE(SUM(size_bytes), 0) FROM vault_chunks WHERE recipient = ?",
+            (user,),
+        ).fetchone()
+        return int(row1[0]), int(row1[1]) + int(row2[0])
 
     def _audit_event(
         self,
@@ -486,6 +538,235 @@ class NodeDaemon:
                     conn.execute("COMMIT")
                 self._audit_event(req.actor, service, "JOIN_RESOLVE", "allow", f"{inv_id}:{new_status}", device_id=req.device_id, req_hash=req_hash)
                 return self._sign_response(body, req.seq, STATUS_OK, b'{"resolved":true}'), False
+
+        if req.op == OP_PUT_ENVELOPE:
+            try:
+                data = json.loads(req.payload.decode("utf-8"))
+                env_id = str(data["envelope_id"]).strip()
+                recipient = str(data["recipient"]).strip()
+                if not env_id or len(env_id) > 128 or not recipient or len(recipient) > 128:
+                    raise ValueError("Invalid envelope_id or recipient")
+                if "payload" not in data:
+                    raise ValueError("Missing payload")
+                payload_json = json.dumps(data["payload"], allow_nan=False, separators=(",", ":"))
+                ttl_s = int(data.get("ttl_s", DEFAULT_ENVELOPE_TTL_S))
+                ttl_s = max(1, min(ttl_s, MAX_ENVELOPE_TTL_S))
+                burn = 1 if data.get("burn_after_read") else 0
+            except Exception:
+                self._audit_event(req.actor, service, "PUT_ENVELOPE", "deny", "BAD_PAYLOAD", device_id=req.device_id, req_hash=req_hash)
+                return self._sign_response(body, req.seq, STATUS_BAD_REQUEST, b""), False
+
+            now = int(time.time())
+            expires_at = now + ttl_s
+            size_bytes = len(payload_json.encode("utf-8"))
+            with self._connect_db() as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                self._purge_expired(conn, now)
+                cnt, used_bytes = self._user_quota_usage(conn, recipient)
+                if cnt >= self.max_envelopes_per_user or used_bytes + size_bytes > self.max_storage_bytes_per_user:
+                    conn.execute("ROLLBACK")
+                    self._audit_event(req.actor, service, "PUT_ENVELOPE", "deny", "QUOTA_EXCEEDED", device_id=req.device_id, req_hash=req_hash)
+                    return self._sign_response(body, req.seq, STATUS_DENIED, b""), False
+                try:
+                    conn.execute(
+                        "INSERT INTO relay_envelopes (envelope_id, sender, recipient, payload_json, size_bytes, created_at, expires_at, burn_after_read) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                        (env_id, req.actor, recipient, payload_json, size_bytes, now, expires_at, burn),
+                    )
+                    conn.execute("COMMIT")
+                except sqlite3.IntegrityError:
+                    conn.execute("ROLLBACK")
+                    self._audit_event(req.actor, service, "PUT_ENVELOPE", "deny", "DUPLICATE_ENVELOPE", device_id=req.device_id, req_hash=req_hash)
+                    return self._sign_response(body, req.seq, STATUS_DENIED, b""), False
+            self._audit_event(req.actor, service, "PUT_ENVELOPE", "allow", f"to={recipient}", device_id=req.device_id, req_hash=req_hash)
+            out = json.dumps({"stored": True, "envelope_id": env_id, "expires_at": expires_at}, separators=(",", ":")).encode("utf-8")
+            return self._sign_response(body, req.seq, STATUS_OK, out), False
+
+        if req.op == OP_LIST_INBOX:
+            now = int(time.time())
+            with self._connect_db() as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                self._purge_expired(conn, now)
+                rows = conn.execute(
+                    "SELECT envelope_id, sender, size_bytes, created_at, expires_at, burn_after_read "
+                    "FROM relay_envelopes WHERE recipient = ? AND expires_at > ? ORDER BY created_at ASC",
+                    (req.actor, now),
+                ).fetchall()
+                conn.execute("COMMIT")
+            items = [
+                {
+                    "envelope_id": r["envelope_id"],
+                    "sender": r["sender"],
+                    "size_bytes": int(r["size_bytes"]),
+                    "created_at": int(r["created_at"]),
+                    "expires_at": int(r["expires_at"]),
+                    "burn_after_read": bool(r["burn_after_read"]),
+                }
+                for r in rows
+            ]
+            self._audit_event(req.actor, service, "LIST_INBOX", "allow", f"count={len(items)}", device_id=req.device_id, req_hash=req_hash)
+            return self._sign_response(body, req.seq, STATUS_OK, json.dumps(items, separators=(",", ":")).encode("utf-8")), False
+
+        if req.op == OP_FETCH_ENVELOPE:
+            try:
+                data = json.loads(req.payload.decode("utf-8"))
+                env_id = str(data["envelope_id"]).strip()
+                if not env_id:
+                    raise ValueError("Missing envelope_id")
+            except Exception:
+                self._audit_event(req.actor, service, "FETCH_ENVELOPE", "deny", "BAD_PAYLOAD", device_id=req.device_id, req_hash=req_hash)
+                return self._sign_response(body, req.seq, STATUS_BAD_REQUEST, b""), False
+
+            now = int(time.time())
+            with self._connect_db() as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                self._purge_expired(conn, now)
+                meta = conn.execute(
+                    "SELECT recipient, burn_after_read FROM relay_envelopes WHERE envelope_id = ? AND expires_at > ?",
+                    (env_id, now),
+                ).fetchone()
+                if meta is None:
+                    conn.execute("ROLLBACK")
+                    self._audit_event(req.actor, service, "FETCH_ENVELOPE", "deny", "NOT_FOUND", device_id=req.device_id, req_hash=req_hash)
+                    return self._sign_response(body, req.seq, STATUS_DENIED, b""), False
+                if meta["recipient"] != req.actor:
+                    conn.execute("ROLLBACK")
+                    self._audit_event(req.actor, service, "FETCH_ENVELOPE", "deny", "RECIPIENT_MISMATCH", device_id=req.device_id, req_hash=req_hash)
+                    return self._sign_response(body, req.seq, STATUS_DENIED, b""), False
+                if int(meta["burn_after_read"]) == 1:
+                    row = conn.execute(
+                        "DELETE FROM relay_envelopes WHERE envelope_id = ? AND recipient = ? "
+                        "RETURNING envelope_id, sender, recipient, payload_json, created_at, expires_at, burn_after_read",
+                        (env_id, req.actor),
+                    ).fetchone()
+                else:
+                    row = conn.execute(
+                        "SELECT envelope_id, sender, recipient, payload_json, created_at, expires_at, burn_after_read "
+                        "FROM relay_envelopes WHERE envelope_id = ? AND recipient = ?",
+                        (env_id, req.actor),
+                    ).fetchone()
+                if row is None:
+                    conn.execute("ROLLBACK")
+                    self._audit_event(req.actor, service, "FETCH_ENVELOPE", "deny", "NOT_FOUND", device_id=req.device_id, req_hash=req_hash)
+                    return self._sign_response(body, req.seq, STATUS_DENIED, b""), False
+                conn.execute("COMMIT")
+            out = json.dumps(
+                {
+                    "envelope_id": row["envelope_id"],
+                    "sender": row["sender"],
+                    "recipient": row["recipient"],
+                    "payload": json.loads(row["payload_json"]),
+                    "created_at": int(row["created_at"]),
+                    "expires_at": int(row["expires_at"]),
+                    "burn_after_read": bool(row["burn_after_read"]),
+                },
+                separators=(",", ":"),
+            ).encode("utf-8")
+            self._audit_event(req.actor, service, "FETCH_ENVELOPE", "allow", f"id={env_id}", device_id=req.device_id, req_hash=req_hash)
+            return self._sign_response(body, req.seq, STATUS_OK, out), False
+
+        if req.op == OP_ACK:
+            try:
+                data = json.loads(req.payload.decode("utf-8"))
+                env_id = str(data["envelope_id"]).strip()
+                if not env_id:
+                    raise ValueError("Missing envelope_id")
+            except Exception:
+                self._audit_event(req.actor, service, "ACK", "deny", "BAD_PAYLOAD", device_id=req.device_id, req_hash=req_hash)
+                return self._sign_response(body, req.seq, STATUS_BAD_REQUEST, b""), False
+
+            with self._connect_db() as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                deleted = conn.execute(
+                    "DELETE FROM relay_envelopes WHERE envelope_id = ? AND recipient = ? RETURNING envelope_id",
+                    (env_id, req.actor),
+                ).fetchone()
+                if deleted is None:
+                    conn.execute("ROLLBACK")
+                    self._audit_event(req.actor, service, "ACK", "deny", "NOT_FOUND", device_id=req.device_id, req_hash=req_hash)
+                    return self._sign_response(body, req.seq, STATUS_DENIED, b""), False
+                conn.execute("COMMIT")
+            self._audit_event(req.actor, service, "ACK", "allow", f"id={env_id}", device_id=req.device_id, req_hash=req_hash)
+            return self._sign_response(body, req.seq, STATUS_OK, b'{"acked":true}'), False
+
+        if req.op == OP_PUT_CHUNK:
+            try:
+                data = json.loads(req.payload.decode("utf-8"))
+                chunk_key = str(data["chunk_key"]).strip()
+                recipient = str(data["recipient"]).strip()
+                if not chunk_key or len(chunk_key) > 160 or not recipient or len(recipient) > 128:
+                    raise ValueError("Invalid chunk_key or recipient")
+                if "payload" not in data:
+                    raise ValueError("Missing payload")
+                payload_json = json.dumps(data["payload"], allow_nan=False, separators=(",", ":"))
+                ttl_s = max(1, min(int(data.get("ttl_s", DEFAULT_ENVELOPE_TTL_S)), MAX_ENVELOPE_TTL_S))
+            except Exception:
+                self._audit_event(req.actor, service, "PUT_CHUNK", "deny", "BAD_PAYLOAD", device_id=req.device_id, req_hash=req_hash)
+                return self._sign_response(body, req.seq, STATUS_BAD_REQUEST, b""), False
+
+            now = int(time.time())
+            expires_at = now + ttl_s
+            size_bytes = len(payload_json.encode("utf-8"))
+            with self._connect_db() as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                self._purge_expired(conn, now)
+                _, used_bytes = self._user_quota_usage(conn, recipient)
+                if used_bytes + size_bytes > self.max_storage_bytes_per_user:
+                    conn.execute("ROLLBACK")
+                    self._audit_event(req.actor, service, "PUT_CHUNK", "deny", "QUOTA_EXCEEDED", device_id=req.device_id, req_hash=req_hash)
+                    return self._sign_response(body, req.seq, STATUS_DENIED, b""), False
+                try:
+                    conn.execute(
+                        "INSERT INTO vault_chunks (chunk_key, owner, recipient, payload_json, size_bytes, created_at, expires_at) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                        (chunk_key, req.actor, recipient, payload_json, size_bytes, now, expires_at),
+                    )
+                    conn.execute("COMMIT")
+                except sqlite3.IntegrityError:
+                    conn.execute("ROLLBACK")
+                    self._audit_event(req.actor, service, "PUT_CHUNK", "deny", "DUPLICATE_CHUNK", device_id=req.device_id, req_hash=req_hash)
+                    return self._sign_response(body, req.seq, STATUS_DENIED, b""), False
+            self._audit_event(req.actor, service, "PUT_CHUNK", "allow", f"key={chunk_key}", device_id=req.device_id, req_hash=req_hash)
+            out = json.dumps({"stored": True, "chunk_key": chunk_key}, separators=(",", ":")).encode("utf-8")
+            return self._sign_response(body, req.seq, STATUS_OK, out), False
+
+        if req.op == OP_GET_CHUNK:
+            try:
+                data = json.loads(req.payload.decode("utf-8"))
+                chunk_key = str(data["chunk_key"]).strip()
+                if not chunk_key:
+                    raise ValueError("Missing chunk_key")
+            except Exception:
+                self._audit_event(req.actor, service, "GET_CHUNK", "deny", "BAD_PAYLOAD", device_id=req.device_id, req_hash=req_hash)
+                return self._sign_response(body, req.seq, STATUS_BAD_REQUEST, b""), False
+
+            now = int(time.time())
+            with self._connect_db() as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                self._purge_expired(conn, now)
+                row = conn.execute(
+                    "SELECT chunk_key, owner, recipient, payload_json, created_at, expires_at "
+                    "FROM vault_chunks WHERE chunk_key = ? AND expires_at > ?",
+                    (chunk_key, now),
+                ).fetchone()
+                if row is None or (row["recipient"] != req.actor and row["owner"] != req.actor):
+                    conn.execute("ROLLBACK")
+                    self._audit_event(req.actor, service, "GET_CHUNK", "deny", "NOT_FOUND_OR_FORBIDDEN", device_id=req.device_id, req_hash=req_hash)
+                    return self._sign_response(body, req.seq, STATUS_DENIED, b""), False
+                conn.execute("COMMIT")
+            out = json.dumps(
+                {
+                    "chunk_key": row["chunk_key"],
+                    "owner": row["owner"],
+                    "recipient": row["recipient"],
+                    "payload": json.loads(row["payload_json"]),
+                    "created_at": int(row["created_at"]),
+                    "expires_at": int(row["expires_at"]),
+                },
+                separators=(",", ":"),
+            ).encode("utf-8")
+            self._audit_event(req.actor, service, "GET_CHUNK", "allow", f"key={chunk_key}", device_id=req.device_id, req_hash=req_hash)
+            return self._sign_response(body, req.seq, STATUS_OK, out), False
 
         self._audit_event(
             req.actor, service, f"OP_{req.op}", "deny", "UNSUPPORTED_OP",

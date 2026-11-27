@@ -10,10 +10,16 @@ from graviton.feed.encoding import enc_u64
 from graviton.net.protocol import (
     DEFAULT_MAX_FRAME_BYTES,
     JOIN_SIGN_DOMAIN,
+    OP_ACK,
     OP_FEED_PULL,
+    OP_FETCH_ENVELOPE,
+    OP_GET_CHUNK,
     OP_INVITE_CREATE,
     OP_JOIN_LIST,
     OP_JOIN_RESOLVE,
+    OP_LIST_INBOX,
+    OP_PUT_CHUNK,
+    OP_PUT_ENVELOPE,
     OP_STATUS,
     REQUEST_SIGN_DOMAIN,
     RESPONSE_SIGN_DOMAIN,
@@ -230,4 +236,112 @@ class NodeClient:
         resp = self.send_request(actor, device_id, key_version, signing_sk, OP_JOIN_RESOLVE, payload)
         if resp.status != 0:
             raise NodeClientError(f"JOIN_RESOLVE denied (status={resp.status})")
+        return json.loads(resp.payload.decode("utf-8"))
+
+    def put_envelope(
+        self,
+        actor: str,
+        device_id: str,
+        key_version: int,
+        signing_sk: bytes,
+        envelope_id: str,
+        recipient: str,
+        payload: dict | str,
+        *,
+        ttl_s: int = 3600,
+        burn_after_read: bool = False,
+    ) -> dict:
+        body = json.dumps(
+            {
+                "envelope_id": envelope_id,
+                "recipient": recipient,
+                "payload": payload,
+                "ttl_s": ttl_s,
+                "burn_after_read": burn_after_read,
+            },
+            separators=(",", ":"),
+        ).encode("utf-8")
+        resp = self.send_request(actor, device_id, key_version, signing_sk, OP_PUT_ENVELOPE, body)
+        if resp.status != 0:
+            raise NodeClientError(f"PUT_ENVELOPE denied (status={resp.status})")
+        return json.loads(resp.payload.decode("utf-8"))
+
+    def list_inbox(
+        self,
+        actor: str,
+        device_id: str,
+        key_version: int,
+        signing_sk: bytes,
+    ) -> list[dict]:
+        resp = self.send_request(actor, device_id, key_version, signing_sk, OP_LIST_INBOX, b"")
+        if resp.status != 0:
+            raise NodeClientError(f"LIST_INBOX denied (status={resp.status})")
+        return json.loads(resp.payload.decode("utf-8"))
+
+    def fetch_envelope(
+        self,
+        actor: str,
+        device_id: str,
+        key_version: int,
+        signing_sk: bytes,
+        envelope_id: str,
+    ) -> dict:
+        body = json.dumps({"envelope_id": envelope_id}, separators=(",", ":")).encode("utf-8")
+        resp = self.send_request(actor, device_id, key_version, signing_sk, OP_FETCH_ENVELOPE, body)
+        if resp.status != 0:
+            raise NodeClientError(f"FETCH_ENVELOPE denied (status={resp.status})")
+        return json.loads(resp.payload.decode("utf-8"))
+
+    def ack_envelope(
+        self,
+        actor: str,
+        device_id: str,
+        key_version: int,
+        signing_sk: bytes,
+        envelope_id: str,
+    ) -> dict:
+        body = json.dumps({"envelope_id": envelope_id}, separators=(",", ":")).encode("utf-8")
+        resp = self.send_request(actor, device_id, key_version, signing_sk, OP_ACK, body)
+        if resp.status != 0:
+            raise NodeClientError(f"ACK denied (status={resp.status})")
+        return json.loads(resp.payload.decode("utf-8"))
+
+    def put_chunk(
+        self,
+        actor: str,
+        device_id: str,
+        key_version: int,
+        signing_sk: bytes,
+        chunk_key: str,
+        recipient: str,
+        payload: dict,
+        *,
+        ttl_s: int = 3600,
+    ) -> dict:
+        body = json.dumps(
+            {
+                "chunk_key": chunk_key,
+                "recipient": recipient,
+                "payload": payload,
+                "ttl_s": ttl_s,
+            },
+            separators=(",", ":"),
+        ).encode("utf-8")
+        resp = self.send_request(actor, device_id, key_version, signing_sk, OP_PUT_CHUNK, body)
+        if resp.status != 0:
+            raise NodeClientError(f"PUT_CHUNK denied (status={resp.status})")
+        return json.loads(resp.payload.decode("utf-8"))
+
+    def get_chunk(
+        self,
+        actor: str,
+        device_id: str,
+        key_version: int,
+        signing_sk: bytes,
+        chunk_key: str,
+    ) -> dict:
+        body = json.dumps({"chunk_key": chunk_key}, separators=(",", ":")).encode("utf-8")
+        resp = self.send_request(actor, device_id, key_version, signing_sk, OP_GET_CHUNK, body)
+        if resp.status != 0:
+            raise NodeClientError(f"GET_CHUNK denied (status={resp.status})")
         return json.loads(resp.payload.decode("utf-8"))

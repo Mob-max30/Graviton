@@ -3,7 +3,9 @@ from __future__ import annotations
 
 import argparse
 import base64
+import cmd
 from pathlib import Path
+import shlex
 import sys
 
 from graviton.admin import AdminManager, read_passphrase
@@ -11,6 +13,7 @@ from graviton.audit import AuditLog
 from graviton.bench.suite import run_benchmarks
 from graviton.client import ClientManager
 from graviton.cluster import cluster_down, cluster_status, cluster_up
+from graviton.crypto.aead import AeadUnavailableError, aead_available
 from graviton.crypto.keystore import load_keystore
 from graviton.daemon.node import init_node_daemon, run_node_cli
 from graviton.detect import evaluate_detection
@@ -59,6 +62,24 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("identity", help="Show member handle, device ID, and fingerprint")
     p_join = sub.add_parser("join", help="Join a group using an invite file")
     p_join.add_argument("invite_file", type=Path)
+
+    p_send = sub.add_parser("send", help="Send an E2EE message or file to a member")
+    p_send.add_argument("target")
+    p_send.add_argument("text", nargs="?", default=None)
+    p_send.add_argument("--file", type=Path, default=None)
+    p_send.add_argument("--ttl", default="1h")
+    p_send.add_argument("--burn", action="store_true")
+
+    sub.add_parser("inbox", help="List pending encrypted envelopes and process handshakes")
+
+    p_read = sub.add_parser("read", help="Fetch and decrypt an envelope by ID")
+    p_read.add_argument("envelope_id")
+    p_read.add_argument("--out", type=Path, default=None, help="Output file path for file transfers")
+
+    p_chat = sub.add_parser("chat", help="Interactive E2EE chat session with a member")
+    p_chat.add_argument("handle")
+
+    sub.add_parser("shell", help="Interactive Graviton member shell (stdlib cmd)")
 
     p_adm = sub.add_parser("admin", help="Group admin commands (uses scrypt keystore)")
     adm_sub = p_adm.add_subparsers(dest="admin_cmd", required=True)
@@ -165,6 +186,125 @@ def main(argv: list[str] | None = None) -> int:
         res = ClientManager().join_invite(args.invite_file, pw)
         print(f"Join request submitted: status={res.get('status')} device_fp={res.get('device_fp')}")
         return 0
+
+    if args.command in ("send", "inbox", "read", "chat", "shell"):
+        if not aead_available():
+            print(
+                "Error: End-to-end messaging commands require the 'app' extra ('cryptography'). "
+                "Install with: pip install '.[app]'",
+                file=sys.stderr,
+            )
+            return 1
+        mgr = ClientManager()
+        try:
+            pw = read_passphrase("Member keystore passphrase: ")
+            if args.command == "send":
+                if args.file is not None:
+                    data = args.file.read_bytes()
+                    res = mgr.send_message_to(
+                        args.target,
+                        data,
+                        pw,
+                        is_file=True,
+                        filename=args.file.name,
+                        ttl_s=AdminManager.parse_ttl(args.ttl),
+                        burn=args.burn,
+                    )
+                else:
+                    if args.text is None:
+                        print("Provide TEXT or --file PATH", file=sys.stderr)
+                        return 2
+                    res = mgr.send_message_to(
+                        args.target,
+                        args.text,
+                        pw,
+                        ttl_s=AdminManager.parse_ttl(args.ttl),
+                        burn=args.burn,
+                    )
+                print(res)
+                return 0
+            if args.command == "inbox":
+                mgr.flush_outbox(pw)
+                items = mgr.inbox(pw)
+                for it in items:
+                    print(
+                        f"id={it['envelope_id']} from={it['sender']} "
+                        f"bytes={it['size_bytes']} burn={it['burn_after_read']}"
+                    )
+                if not items:
+                    print("(inbox empty)")
+                return 0
+            if args.command == "read":
+                res = mgr.read_message(args.envelope_id, pw)
+                if res["kind"] == "msg":
+                    print(f"[{res['sender']}] {res['text']}")
+                else:
+                    out_path = args.out or Path(res["filename"])
+                    out_path.write_bytes(res["data"])
+                    print(f"[{res['sender']}] file saved to {out_path} ({len(res['data'])} bytes)")
+                return 0
+            if args.command == "chat":
+                print(f"E2EE chat with {args.handle} (Ctrl-D or /quit to exit)")
+                while True:
+                    mgr.flush_outbox(pw)
+                    for it in mgr.inbox(pw):
+                        if it["sender"] == args.handle:
+                            msg = mgr.read_message(it["envelope_id"], pw)
+                            if msg["kind"] == "msg":
+                                print(f"<{msg['sender']}> {msg['text']}")
+                    try:
+                        line = input(f"to {args.handle}> ")
+                    except EOFError:
+                        break
+                    if line.strip() in ("/quit", "/exit"):
+                        break
+                    if line.strip():
+                        r = mgr.send_message_to(args.handle, line, pw)
+                        if r.get("queued"):
+                            print("(handshake initiated; message queued)")
+                return 0
+            if args.command == "shell":
+                class _GravitonShell(cmd.Cmd):
+                    intro = "Graviton member shell. Type 'help' or 'quit'."
+                    prompt = "graviton> "
+
+                    def do_identity(self, _arg: str) -> None:
+                        st = mgr.get_identity()
+                        print(f"handle={st['handle']} device_id={st['device_id']} fp={st['fingerprint']}")
+
+                    def do_inbox(self, _arg: str) -> None:
+                        mgr.flush_outbox(pw)
+                        for it in mgr.inbox(pw):
+                            print(f"id={it['envelope_id']} from={it['sender']} bytes={it['size_bytes']}")
+
+                    def do_read(self, arg: str) -> None:
+                        eid = arg.strip()
+                        if not eid:
+                            print("Usage: read ENVELOPE_ID")
+                            return
+                        msg = mgr.read_message(eid, pw)
+                        print(f"[{msg['sender']}] {msg.get('text') or msg.get('filename')}")
+
+                    def do_send(self, arg: str) -> None:
+                        parts = shlex.split(arg)
+                        if len(parts) < 2:
+                            print("Usage: send TARGET TEXT")
+                            return
+                        print(mgr.send_message_to(parts[0], " ".join(parts[1:]), pw))
+
+                    def do_quit(self, _arg: str) -> bool:
+                        return True
+
+                    def do_exit(self, _arg: str) -> bool:
+                        return True
+
+                    do_EOF = do_quit
+
+                _GravitonShell().cmdloop()
+                return 0
+        except AeadUnavailableError as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            return 1
 
     if args.command == "admin":
         mgr = AdminManager()
