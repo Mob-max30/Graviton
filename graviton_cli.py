@@ -14,7 +14,11 @@ import sqlite3
 import subprocess
 import sys
 import time
+import urllib.error
+import urllib.parse
+import urllib.request
 import uuid
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
@@ -115,8 +119,8 @@ def _db_path() -> Path:
     return Path(os.environ.get("GRAVITON_DB_PATH", str(_data_dir() / "graviton.db")))
 
 
-def _connect() -> sqlite3.Connection:
-    p = _db_path()
+def _connect(db_path: Path | None = None) -> sqlite3.Connection:
+    p = db_path or _db_path()
     p.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(p), timeout=15.0)
     conn.row_factory = sqlite3.Row
@@ -143,6 +147,34 @@ def _audit_logger(org: dict[str, Any]) -> SignedAuditLogger:
 
 def _active_org_file() -> Path:
     return _data_dir() / ".active_org"
+
+
+def _server_url_file() -> Path:
+    return _data_dir() / ".server_url"
+
+
+def _get_server_url() -> str | None:
+    f = _server_url_file()
+    if f.exists():
+        val = f.read_text(encoding="utf-8").strip()
+        return val or None
+    return None
+
+
+def _remote_call(method: str, path: str, payload: dict[str, Any] | None = None) -> Any:
+    base = _get_server_url()
+    if not base:
+        raise RuntimeError("Not connected to a remote server")
+    url = f"{base.rstrip('/')}{path}"
+    data = json.dumps(payload).encode("utf-8") if payload is not None else None
+    headers = {"Content-Type": "application/json", "X-Client-IP": _primary_machine_ip()}
+    req = urllib.request.Request(url, data=data, headers=headers, method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=5.0) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as err:
+        detail = err.read().decode("utf-8", errors="replace")
+        raise RuntimeError(detail or f"HTTP {err.code}") from err
 
 
 def _set_active_org(org_id: str) -> None:
@@ -324,6 +356,11 @@ def cmd_register(company_name: str, admin_username: str | None = None) -> None:
 
 
 def cmd_use(company_name: str) -> None:
+    if _get_server_url():
+        res = _remote_call("POST", "/api/use", {"company_name": company_name.strip()})
+        _set_active_org(res["org_id"])
+        print(res["label"])
+        return
     with _connect() as conn:
         row = conn.execute(
             "SELECT * FROM organizations WHERE LOWER(name) = LOWER(?) ORDER BY created_at DESC LIMIT 1",
@@ -424,20 +461,26 @@ def cmd_add(target_path: str) -> None:
 
 
 def cmd_ls(folder_filter: str | None = None) -> None:
-    with _connect() as conn:
-        org = _get_active_org(conn)
-        if _is_admin_ip(conn, org):
-            print(f"({org['name']})")
-        rows = conn.execute(
-            "SELECT * FROM resources WHERE org_id = ? ORDER BY created_at DESC",
-            (org["org_id"],),
-        ).fetchall()
+    if _get_server_url():
+        org_id = _active_org_file().read_text(encoding="utf-8").strip() if _active_org_file().exists() else ""
+        res = _remote_call("GET", f"/api/ls?org_id={urllib.parse.quote(org_id)}")
+        if res.get("header"):
+            print(res["header"])
+        items = res.get("items", [])
+    else:
+        with _connect() as conn:
+            org = _get_active_org(conn)
+            if _is_admin_ip(conn, org):
+                print(f"({org['name']})")
+            rows = conn.execute(
+                "SELECT * FROM resources WHERE org_id = ? ORDER BY created_at DESC",
+                (org["org_id"],),
+            ).fetchall()
+        items = [dict(r) for r in rows]
 
-    if not rows:
+    if not items:
         print("No files or folders added yet.")
         return
-
-    items = [dict(r) for r in rows]
     folders = [i for i in items if i["kind"] == "folder"]
     files = [i for i in items if i["kind"] != "folder"]
     folder_names = [f["name"] for f in folders]
@@ -582,7 +625,65 @@ def cmd_add_people() -> None:
     print(f"Added {numbered_name} (position: {position}, device IP: {device_ip}, id: {user_id})")
 
 
+def _remote_chat() -> None:
+    org_id = _active_org_file().read_text(encoding="utf-8").strip() if _active_org_file().exists() else ""
+    info = _remote_call("GET", f"/api/chat/peers?org_id={urllib.parse.quote(org_id)}")
+    me = info["me"]
+    others = info["others"]
+    if not others:
+        print("No other members available to chat with.")
+        raise SystemExit(1)
+
+    print(f"\n[{info['org_name']}] Logged in as: {me['username']} [{me['identifier']}]")
+    print("Select member to chat with:")
+    for idx, u in enumerate(others, start=1):
+        print(f"  {idx}. {u['username']} [{u['identifier']}]")
+
+    peer_idx = int(input("Chat with (number): ").strip()) - 1
+    if not (0 <= peer_idx < len(others)):
+        print("Invalid member selection.")
+        raise SystemExit(1)
+    peer = others[peer_idx]
+
+    print(f"\nEncrypted PQC chat started with {peer['username']} (type /refresh to read, /quit to exit)\n")
+    last_seen = 0.0
+
+    def _poll(since_ts: float) -> float:
+        msgs = _remote_call(
+            "GET",
+            f"/api/chat/messages?org_id={urllib.parse.quote(info['org_id'])}&peer_id={urllib.parse.quote(peer['user_id'])}&since={since_ts}",
+        )
+        t = since_ts
+        for m in msgs:
+            if m["sender_user_id"] == me["user_id"]:
+                print(f"{GREEN}[{me['username']}]: {m['plaintext']}{RESET}")
+            else:
+                print(f"{WHITE}[{peer['username']}]: {m['plaintext']}{RESET}")
+            t = max(t, float(m["created_at"]))
+        return t
+
+    last_seen = _poll(0.0)
+    while True:
+        text = input("> ").strip()
+        if not text:
+            continue
+        if text == "/quit":
+            break
+        if text == "/refresh":
+            last_seen = _poll(last_seen)
+            continue
+        _remote_call(
+            "POST",
+            "/api/chat/send",
+            {"org_id": info["org_id"], "peer_id": peer["user_id"], "text": text},
+        )
+        last_seen = _poll(last_seen)
+
+
 def cmd_chat() -> None:
+    if _get_server_url():
+        _remote_chat()
+        return
     with _connect() as conn:
         org = _get_active_org(conn)
         users = conn.execute(
@@ -739,56 +840,297 @@ def cmd_chat() -> None:
 
 def cmd_people() -> None:
     """List members grouped by their identifier/position section along with their org and IP."""
-    with _connect() as conn:
-        org = _get_active_org(conn)
-        if _is_admin_ip(conn, org):
-            print(f"({org['name']})")
-        rows = conn.execute(
-            """
-            SELECT u.username, u.identifier, u.is_admin, d.device_ip, d.status
-            FROM users u
-            JOIN devices d ON u.user_id = d.user_id
-            WHERE u.org_id = ?
-            ORDER BY u.is_admin DESC, u.identifier ASC, u.created_at ASC
-            """,
-            (org["org_id"],),
-        ).fetchall()
+    if _get_server_url():
+        org_id = _active_org_file().read_text(encoding="utf-8").strip() if _active_org_file().exists() else ""
+        res = _remote_call("GET", f"/api/people?org_id={urllib.parse.quote(org_id)}")
+        if res.get("header"):
+            print(res["header"])
+        rows = res.get("members", [])
+        org_name = res.get("org_name", "")
+    else:
+        with _connect() as conn:
+            org = _get_active_org(conn)
+            if _is_admin_ip(conn, org):
+                print(f"({org['name']})")
+            org_name = org["name"]
+            db_rows = conn.execute(
+                """
+                SELECT u.username, u.identifier, u.is_admin, d.device_ip, d.status
+                FROM users u
+                JOIN devices d ON u.user_id = d.user_id
+                WHERE u.org_id = ?
+                ORDER BY u.is_admin DESC, u.identifier ASC, u.created_at ASC
+                """,
+                (org["org_id"],),
+            ).fetchall()
+            rows = [dict(r) for r in db_rows]
 
     if not rows:
         print("No members found.")
         return
-    grouped: dict[str, list[sqlite3.Row]] = {}
+    grouped: dict[str, list[dict[str, Any]]] = {}
     for r in rows:
         grouped.setdefault(r["identifier"], []).append(r)
 
     for ident, members in grouped.items():
-        print(f"[{ident}] ({org['name']})")
+        print(f"[{ident}] ({org_name})")
         for m in members:
             print(f"  - {m['username']} -> IP: {m['device_ip']} ({m['status']})")
 
 
 def cmd_orgs() -> None:
     """List all organizations this device IP belongs to."""
-    ips = _current_machine_ips()
     active_id = _active_org_file().read_text(encoding="utf-8").strip() if _active_org_file().exists() else ""
-    with _connect() as conn:
-        rows = conn.execute(
-            """
-            SELECT o.org_id, o.name, u.username, u.identifier, u.is_admin, d.device_ip
-            FROM organizations o
-            JOIN users u ON o.org_id = u.org_id
-            JOIN devices d ON u.user_id = d.user_id AND d.status = 'ACTIVE'
-            ORDER BY o.created_at DESC
-            """
-        ).fetchall()
+    if _get_server_url():
+        matched = _remote_call("GET", "/api/orgs")
+    else:
+        ips = _current_machine_ips()
+        with _connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT o.org_id, o.name, u.username, u.identifier, u.is_admin, d.device_ip
+                FROM organizations o
+                JOIN users u ON o.org_id = u.org_id
+                JOIN devices d ON u.user_id = d.user_id AND d.status = 'ACTIVE'
+                ORDER BY o.created_at DESC
+                """
+            ).fetchall()
+        matched = [dict(r) for r in rows if r["device_ip"] in ips]
 
-    matched = [r for r in rows if r["device_ip"] in ips]
     if not matched:
         print("This device is not added to any organization.")
         return
     for r in matched:
         mark = "* " if r["org_id"] == active_id else "  "
         print(f"{mark}{r['name']} -> {r['username']} [{r['identifier']}] (IP: {r['device_ip']})")
+
+
+def cmd_connect(server_target: str) -> None:
+    """Connect this user device to the admin Graviton server IP."""
+    target = server_target.strip()
+    url = target if target.startswith("http") else f"http://{target}:8765"
+    _server_url_file().write_text(url, encoding="utf-8")
+    try:
+        res = _remote_call("GET", "/api/health")
+        print(f"Connected to Graviton server at {url} ({res.get('status')})")
+    except Exception as exc:
+        _server_url_file().unlink(missing_ok=True)
+        print(f"Could not connect to {url}: {exc}")
+        raise SystemExit(1)
+
+
+def _make_server_handler(db_path: Path | None = None):
+    srv_db = db_path or _db_path()
+
+    class GravitonHandler(BaseHTTPRequestHandler):
+        def log_message(self, fmt: str, *args: Any) -> None:
+            return
+
+        def _send_json(self, code: int, obj: Any) -> None:
+            body = json.dumps(obj).encode("utf-8")
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def _client_ip(self) -> str:
+            return self.headers.get("X-Client-IP") or self.client_address[0]
+
+        def _read_json(self) -> dict[str, Any]:
+            n = int(self.headers.get("Content-Length", "0"))
+            return json.loads(self.rfile.read(n).decode("utf-8")) if n > 0 else {}
+
+        def _resolve_org(self, conn: sqlite3.Connection, org_id: str) -> dict[str, Any] | None:
+            if org_id:
+                r = conn.execute("SELECT * FROM organizations WHERE org_id = ?", (org_id,)).fetchone()
+                if r:
+                    return dict(r)
+            r = conn.execute("SELECT * FROM organizations ORDER BY created_at DESC LIMIT 1").fetchone()
+            return dict(r) if r else None
+
+        def _resolve_user_by_ip(self, conn: sqlite3.Connection, org_id: str, ip: str) -> sqlite3.Row | None:
+            return conn.execute(
+                """
+                SELECT u.*, d.device_ip, d.fingerprint
+                FROM users u
+                JOIN devices d ON u.user_id = d.user_id AND d.status = 'ACTIVE'
+                WHERE u.org_id = ? AND d.device_ip = ?
+                ORDER BY u.created_at ASC LIMIT 1
+                """,
+                (org_id, ip),
+            ).fetchone()
+
+        def do_GET(self) -> None:
+            parsed = urllib.parse.urlparse(self.path)
+            qs = urllib.parse.parse_qs(parsed.query)
+            ip = self._client_ip()
+            if parsed.path == "/api/health":
+                self._send_json(200, {"status": "ok"})
+                return
+            with _connect(srv_db) as conn:
+                if parsed.path == "/api/orgs":
+                    rows = conn.execute(
+                        """
+                        SELECT o.org_id, o.name, u.username, u.identifier, u.is_admin, d.device_ip
+                        FROM organizations o
+                        JOIN users u ON o.org_id = u.org_id
+                        JOIN devices d ON u.user_id = d.user_id AND d.status = 'ACTIVE'
+                        WHERE d.device_ip = ?
+                        ORDER BY o.created_at DESC
+                        """,
+                        (ip,),
+                    ).fetchall()
+                    self._send_json(200, [dict(r) for r in rows])
+                    return
+                org = self._resolve_org(conn, (qs.get("org_id") or [""])[0])
+                if not org:
+                    self._send_json(404, {"error": "No organization"})
+                    return
+                if parsed.path == "/api/ls":
+                    rows = conn.execute(
+                        "SELECT resource_id, name, kind, allowed_identifiers_json FROM resources WHERE org_id = ? ORDER BY created_at DESC",
+                        (org["org_id"],),
+                    ).fetchall()
+                    self._send_json(200, {"header": f"({org['name']})", "items": [dict(r) for r in rows]})
+                    return
+                if parsed.path == "/api/people":
+                    rows = conn.execute(
+                        """
+                        SELECT u.username, u.identifier, u.is_admin, d.device_ip, d.status
+                        FROM users u JOIN devices d ON u.user_id = d.user_id
+                        WHERE u.org_id = ?
+                        ORDER BY u.is_admin DESC, u.identifier ASC, u.created_at ASC
+                        """,
+                        (org["org_id"],),
+                    ).fetchall()
+                    self._send_json(200, {"header": f"({org['name']})", "org_name": org["name"], "members": [dict(r) for r in rows]})
+                    return
+                if parsed.path == "/api/chat/peers":
+                    me = self._resolve_user_by_ip(conn, org["org_id"], ip)
+                    if not me:
+                        self._send_json(403, {"error": f"Device IP {ip} not registered in {org['name']}"})
+                        return
+                    others = conn.execute(
+                        "SELECT user_id, username, identifier FROM users WHERE org_id = ? AND user_id != ? ORDER BY created_at ASC",
+                        (org["org_id"], me["user_id"]),
+                    ).fetchall()
+                    self._send_json(
+                        200,
+                        {
+                            "org_id": org["org_id"],
+                            "org_name": org["name"],
+                            "me": {"user_id": me["user_id"], "username": me["username"], "identifier": me["identifier"]},
+                            "others": [dict(o) for o in others],
+                        },
+                    )
+                    return
+                if parsed.path == "/api/chat/messages":
+                    me = self._resolve_user_by_ip(conn, org["org_id"], ip)
+                    if not me:
+                        self._send_json(403, {"error": "Unauthorized"})
+                        return
+                    peer_id = (qs.get("peer_id") or [""])[0]
+                    since = float((qs.get("since") or ["0"])[0])
+                    msgs = conn.execute(
+                        """
+                        SELECT * FROM chat_messages
+                        WHERE org_id = ?
+                          AND ((sender_user_id = ? AND recipient_user_id = ?)
+                            OR (sender_user_id = ? AND recipient_user_id = ?))
+                          AND created_at > ?
+                        ORDER BY created_at ASC
+                        """,
+                        (org["org_id"], me["user_id"], peer_id, peer_id, me["user_id"], since),
+                    ).fetchall()
+                    out = []
+                    for m in msgs:
+                        pt = ChaCha20Poly1305(bytes(org["vault_key"])).decrypt(bytes(m["nonce"]), bytes(m["ciphertext"]), bytes(m["aad"])).decode("utf-8")
+                        out.append({"sender_user_id": m["sender_user_id"], "plaintext": pt, "created_at": m["created_at"]})
+                    self._send_json(200, out)
+                    return
+            self._send_json(404, {"error": "Not found"})
+
+        def do_POST(self) -> None:
+            parsed = urllib.parse.urlparse(self.path)
+            body = self._read_json()
+            ip = self._client_ip()
+            with _connect(srv_db) as conn:
+                if parsed.path == "/api/use":
+                    cname = str(body.get("company_name", "")).strip()
+                    row = conn.execute(
+                        "SELECT * FROM organizations WHERE LOWER(name) = LOWER(?) ORDER BY created_at DESC LIMIT 1",
+                        (cname,),
+                    ).fetchone()
+                    if not row:
+                        self._send_json(404, {"error": f"Organization not found: {cname}"})
+                        return
+                    org = dict(row)
+                    usr = self._resolve_user_by_ip(conn, org["org_id"], ip)
+                    if not usr:
+                        self._send_json(403, {"error": f"Device IP {ip} is not registered in {org['name']}"})
+                        return
+                    label = f"({org['name']})" if usr["is_admin"] else f"({org['name']}:{usr['identifier']})"
+                    self._send_json(200, {"org_id": org["org_id"], "label": label})
+                    return
+                if parsed.path == "/api/chat/send":
+                    org = self._resolve_org(conn, str(body.get("org_id", "")))
+                    if not org:
+                        self._send_json(404, {"error": "Org not found"})
+                        return
+                    me = self._resolve_user_by_ip(conn, org["org_id"], ip)
+                    if not me:
+                        self._send_json(403, {"error": "Unauthorized"})
+                        return
+                    peer_id = str(body.get("peer_id", ""))
+                    text = str(body.get("text", ""))
+                    peer_dev = conn.execute(
+                        "SELECT fingerprint FROM devices WHERE org_id = ? AND user_id = ? AND status = 'ACTIVE' LIMIT 1",
+                        (org["org_id"], peer_id),
+                    ).fetchone()
+                    if not peer_dev:
+                        self._send_json(404, {"error": "Peer not found"})
+                        return
+                    msg_id = f"msg_{uuid.uuid4().hex[:12]}"
+                    nonce = secrets.token_bytes(12)
+                    aad = AssociatedData(
+                        protocol_version=1,
+                        suite_id=int(CipherSuite.SUITE_HYBRID),
+                        sender_id=me["user_id"],
+                        recipient_id=peer_id,
+                        recipient_key_fingerprint=peer_dev["fingerprint"],
+                        recipient_epoch=1,
+                        session_id=f"net_{org['org_id']}",
+                        sequence_number=1,
+                        message_id=msg_id,
+                        chunk_index=0,
+                        chunk_count=1,
+                        total_length=len(text.encode("utf-8")),
+                    ).serialize()
+                    ct = ChaCha20Poly1305(bytes(org["vault_key"])).encrypt(nonce, text.encode("utf-8"), aad)
+                    conn.execute(
+                        """
+                        INSERT INTO chat_messages (
+                            message_id, org_id, sender_user_id, recipient_user_id,
+                            session_id, seq_no, nonce, ciphertext, aad, created_at
+                        ) VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?, ?)
+                        """,
+                        (msg_id, org["org_id"], me["user_id"], peer_id, f"net_{org['org_id']}", nonce, ct, aad, time.time()),
+                    )
+                    conn.commit()
+                    _audit_logger(org).append_entry(me["user_id"], "CHAT_SEND", peer_id, "allow")
+                    self._send_json(200, {"sent": True, "message_id": msg_id})
+                    return
+            self._send_json(404, {"error": "Not found"})
+
+    return GravitonHandler
+
+
+def cmd_serve(port: int = 8765) -> None:
+    """Start Graviton network server for multi-container/device clients."""
+    srv = ThreadingHTTPServer(("0.0.0.0", port), _make_server_handler())
+    print(f"Graviton server listening on {_primary_machine_ip()}:{port}")
+    srv.serve_forever()
 
 
 def cmd_prompt() -> None:
@@ -826,6 +1168,8 @@ def main(argv: list[str] | None = None) -> int:
     if not args:
         print("Usage:")
         print("  gt -register <company-name>")
+        print("  gt -serve [port]")
+        print("  gt -connect <server-ip>")
         print("  gt use <company-name>")
         print("  gt orgs")
         print("  gt ls [folder-name]")
@@ -836,6 +1180,15 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     flag = args[0]
+    if flag in ("-serve", "--serve", "serve"):
+        cmd_serve(int(args[1]) if len(args) > 1 else 8765)
+        return 0
+    if flag in ("-connect", "--connect", "connect"):
+        if len(args) < 2:
+            print("Usage: gt -connect <server-ip>")
+            return 1
+        cmd_connect(args[1])
+        return 0
     if flag in ("-register", "--register", "register"):
         if len(args) < 2:
             print("Usage: gt -register <company-name>")

@@ -71,3 +71,46 @@ def test_gt_cli_integrated_with_trustledger(tmp_path: Path, monkeypatch, capsys)
     assert graviton_cli.main(["-chat"]) == 0
     chat_out = capsys.readouterr().out
     assert "hello trustledger" in chat_out
+
+
+def test_remote_user_connect_orgs_and_chat(tmp_path: Path, monkeypatch, capsys):
+    import threading
+    from http.server import ThreadingHTTPServer
+
+    # Server side (admin)
+    srv_data = tmp_path / "srv_data"
+    monkeypatch.setenv("GRAVITON_DATA_DIR", str(srv_data))
+    monkeypatch.setenv("GRAVITON_DB_PATH", str(srv_data / "graviton.db"))
+    assert graviton_cli.main(["-register", "RemoteCorp", "alice"]) == 0
+
+    add_inputs = iter(["1", "eng", "10.0.0.55"])
+    monkeypatch.setattr("builtins.input", lambda _="": next(add_inputs))
+    monkeypatch.setattr(graviton_cli, "check_device_reachable", lambda _ip: True)
+    assert graviton_cli.main(["-add-people"]) == 0
+
+    httpd = ThreadingHTTPServer(("127.0.0.1", 0), graviton_cli._make_server_handler())
+    port = httpd.server_address[1]
+    t = threading.Thread(target=httpd.serve_forever, daemon=True)
+    t.start()
+
+    try:
+        # Remote client side (user eng - 1 with IP 10.0.0.55)
+        cli_data = tmp_path / "cli_data"
+        monkeypatch.setenv("GRAVITON_DATA_DIR", str(cli_data))
+        monkeypatch.setenv("GRAVITON_DB_PATH", str(cli_data / "graviton.db"))
+        monkeypatch.setattr(graviton_cli, "_primary_machine_ip", lambda: "10.0.0.55")
+
+        assert graviton_cli.main(["-connect", f"http://127.0.0.1:{port}"]) == 0
+        assert graviton_cli.main(["orgs"]) == 0
+        orgs_out = capsys.readouterr().out
+        assert "RemoteCorp -> eng - 1 [eng] (IP: 10.0.0.55)" in orgs_out
+
+        assert graviton_cli.main(["use", "RemoteCorp"]) == 0
+        assert "(RemoteCorp:eng)" in capsys.readouterr().out
+
+        chat_inputs = iter(["1", "hi alice", "/quit"])
+        monkeypatch.setattr("builtins.input", lambda _="": next(chat_inputs))
+        assert graviton_cli.main(["-chat"]) == 0
+        assert "hi alice" in capsys.readouterr().out
+    finally:
+        httpd.shutdown()
