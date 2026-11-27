@@ -1089,6 +1089,10 @@ def cmd_connect(server_target: str) -> None:
 
 def _make_server_handler(db_path: Path | None = None):
     srv_db = db_path or _db_path()
+    rate_lock = threading.Lock()
+    rate_buckets: dict[str, list[float]] = {}
+    seq_lock = threading.Lock()
+    last_seq_by_sender: dict[tuple[str, str], int] = {}
 
     class GravitonHandler(BaseHTTPRequestHandler):
         def log_message(self, fmt: str, *args: Any) -> None:
@@ -1099,8 +1103,22 @@ def _make_server_handler(db_path: Path | None = None):
             self.send_response(code)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(body)))
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.send_header("X-Frame-Options", "DENY")
+            self.send_header("Cache-Control", "no-store")
             self.end_headers()
             self.wfile.write(body)
+
+        def _check_rate_limit(self, ip: str, limit: int = 120, window_sec: float = 10.0) -> bool:
+            now = time.monotonic()
+            with rate_lock:
+                bucket = [t for t in rate_buckets.get(ip, []) if now - t <= window_sec]
+                if len(bucket) >= limit:
+                    rate_buckets[ip] = bucket
+                    return False
+                bucket.append(now)
+                rate_buckets[ip] = bucket
+                return True
 
         def _client_ip(self) -> str:
             # Only honor X-Client-IP from localhost (for local test harness); never trust remote spoofed headers
@@ -1140,196 +1158,224 @@ def _make_server_handler(db_path: Path | None = None):
             ).fetchone()
 
         def do_GET(self) -> None:
-            parsed = urllib.parse.urlparse(self.path)
-            qs = urllib.parse.parse_qs(parsed.query)
-            ip = self._client_ip()
-            if parsed.path == "/api/health":
-                self._send_json(200, {"status": "ok"})
-                return
-            with _connect(srv_db) as conn:
-                if parsed.path == "/api/orgs":
-                    rows = conn.execute(
-                        """
-                        SELECT o.org_id, o.name, u.username, u.identifier, u.is_admin, d.device_ip
-                        FROM organizations o
-                        JOIN users u ON o.org_id = u.org_id
-                        JOIN devices d ON u.user_id = d.user_id AND d.status = 'ACTIVE'
-                        WHERE d.device_ip = ?
-                        ORDER BY o.created_at DESC
-                        """,
-                        (ip,),
-                    ).fetchall()
-                    self._send_json(200, [dict(r) for r in rows])
+            try:
+                parsed = urllib.parse.urlparse(self.path)
+                qs = urllib.parse.parse_qs(parsed.query)
+                ip = self._client_ip()
+                if not self._check_rate_limit(ip):
+                    self._send_json(429, {"error": "Rate limit exceeded"})
                     return
-                org = self._resolve_org(conn, (qs.get("org_id") or [""])[0])
-                if not org:
-                    self._send_json(404, {"error": "No organization"})
+                if parsed.path == "/api/health":
+                    self._send_json(200, {"status": "ok"})
                     return
-                if parsed.path == "/api/ls":
-                    me = self._resolve_user_by_ip(conn, org["org_id"], ip)
-                    if not me:
-                        self._send_json(403, {"error": "Unauthorized"})
+                with _connect(srv_db) as conn:
+                    if parsed.path == "/api/orgs":
+                        rows = conn.execute(
+                            """
+                            SELECT o.org_id, o.name, u.username, u.identifier, u.is_admin, d.device_ip
+                            FROM organizations o
+                            JOIN users u ON o.org_id = u.org_id
+                            JOIN devices d ON u.user_id = d.user_id AND d.status = 'ACTIVE'
+                            WHERE d.device_ip = ?
+                            ORDER BY o.created_at DESC
+                            """,
+                            (ip,),
+                        ).fetchall()
+                        self._send_json(200, [dict(r) for r in rows])
                         return
-                    rows = conn.execute(
-                        "SELECT resource_id, name, kind, allowed_identifiers_json FROM resources WHERE org_id = ? ORDER BY created_at DESC",
-                        (org["org_id"],),
-                    ).fetchall()
-                    self._send_json(200, {"header": f"({org['name']})", "items": [dict(r) for r in rows]})
-                    return
-                if parsed.path == "/api/people":
-                    me = self._resolve_user_by_ip(conn, org["org_id"], ip)
-                    if not me:
-                        self._send_json(403, {"error": "Unauthorized"})
+                    org = self._resolve_org(conn, (qs.get("org_id") or [""])[0])
+                    if not org:
+                        self._send_json(404, {"error": "No organization"})
                         return
-                    rows = conn.execute(
-                        """
-                        SELECT u.username, u.identifier, u.is_admin, d.device_ip, d.status
-                        FROM users u JOIN devices d ON u.user_id = d.user_id
-                        WHERE u.org_id = ?
-                        ORDER BY u.is_admin DESC, u.identifier ASC, u.created_at ASC
-                        """,
-                        (org["org_id"],),
-                    ).fetchall()
-                    self._send_json(200, {"header": f"({org['name']})", "org_name": org["name"], "members": [dict(r) for r in rows]})
-                    return
-                if parsed.path == "/api/chat/peers":
-                    me = self._resolve_user_by_ip(conn, org["org_id"], ip)
-                    if not me:
-                        self._send_json(403, {"error": f"Device IP {ip} not registered in {org['name']}"})
+                    if parsed.path == "/api/ls":
+                        me = self._resolve_user_by_ip(conn, org["org_id"], ip)
+                        if not me:
+                            self._send_json(403, {"error": "Unauthorized"})
+                            return
+                        rows = conn.execute(
+                            "SELECT resource_id, name, kind, allowed_identifiers_json FROM resources WHERE org_id = ? ORDER BY created_at DESC",
+                            (org["org_id"],),
+                        ).fetchall()
+                        self._send_json(200, {"header": f"({org['name']})", "items": [dict(r) for r in rows]})
                         return
-                    others = conn.execute(
-                        "SELECT user_id, username, identifier FROM users WHERE org_id = ? AND user_id != ? ORDER BY created_at ASC",
-                        (org["org_id"], me["user_id"]),
-                    ).fetchall()
-                    self._send_json(
-                        200,
-                        {
-                            "org_id": org["org_id"],
-                            "org_name": org["name"],
-                            "me": {"user_id": me["user_id"], "username": me["username"], "identifier": me["identifier"]},
-                            "others": [dict(o) for o in others],
-                        },
-                    )
-                    return
-                if parsed.path == "/api/chat/messages":
-                    me = self._resolve_user_by_ip(conn, org["org_id"], ip)
-                    if not me:
-                        self._send_json(403, {"error": "Unauthorized"})
+                    if parsed.path == "/api/people":
+                        me = self._resolve_user_by_ip(conn, org["org_id"], ip)
+                        if not me:
+                            self._send_json(403, {"error": "Unauthorized"})
+                            return
+                        rows = conn.execute(
+                            """
+                            SELECT u.username, u.identifier, u.is_admin, d.device_ip, d.status
+                            FROM users u JOIN devices d ON u.user_id = d.user_id
+                            WHERE u.org_id = ?
+                            ORDER BY u.is_admin DESC, u.identifier ASC, u.created_at ASC
+                            """,
+                            (org["org_id"],),
+                        ).fetchall()
+                        self._send_json(200, {"header": f"({org['name']})", "org_name": org["name"], "members": [dict(r) for r in rows]})
                         return
-                    peer_id = (qs.get("peer_id") or [""])[0]
-                    since = float((qs.get("since") or ["0"])[0])
-                    # Strictly return ONLY messages between me and peer_id
-                    msgs = conn.execute(
-                        """
-                        SELECT message_id, sender_user_id, recipient_user_id, nonce, ciphertext, aad, created_at
-                        FROM chat_messages
-                        WHERE org_id = ?
-                          AND ((sender_user_id = ? AND recipient_user_id = ?)
-                            OR (sender_user_id = ? AND recipient_user_id = ?))
-                          AND created_at > ?
-                        ORDER BY created_at ASC
-                        """,
-                        (org["org_id"], me["user_id"], peer_id, peer_id, me["user_id"], since),
-                    ).fetchall()
-                    out = [
-                        {
-                            "message_id": m["message_id"],
-                            "sender_user_id": m["sender_user_id"],
-                            "recipient_user_id": m["recipient_user_id"],
-                            "nonce_b64": base64.b64encode(bytes(m["nonce"])).decode("ascii"),
-                            "ct_b64": base64.b64encode(bytes(m["ciphertext"])).decode("ascii"),
-                            "aad_b64": base64.b64encode(bytes(m["aad"])).decode("ascii"),
-                            "created_at": m["created_at"],
-                        }
-                        for m in msgs
-                    ]
-                    self._send_json(200, out)
-                    return
-            self._send_json(404, {"error": "Not found"})
+                    if parsed.path == "/api/chat/peers":
+                        me = self._resolve_user_by_ip(conn, org["org_id"], ip)
+                        if not me:
+                            self._send_json(403, {"error": f"Device IP {ip} not registered in {org['name']}"})
+                            return
+                        others = conn.execute(
+                            "SELECT user_id, username, identifier FROM users WHERE org_id = ? AND user_id != ? ORDER BY created_at ASC",
+                            (org["org_id"], me["user_id"]),
+                        ).fetchall()
+                        self._send_json(
+                            200,
+                            {
+                                "org_id": org["org_id"],
+                                "org_name": org["name"],
+                                "me": {"user_id": me["user_id"], "username": me["username"], "identifier": me["identifier"]},
+                                "others": [dict(o) for o in others],
+                            },
+                        )
+                        return
+                    if parsed.path == "/api/chat/messages":
+                        me = self._resolve_user_by_ip(conn, org["org_id"], ip)
+                        if not me:
+                            self._send_json(403, {"error": "Unauthorized"})
+                            return
+                        peer_id = (qs.get("peer_id") or [""])[0]
+                        since = float((qs.get("since") or ["0"])[0])
+                        msgs = conn.execute(
+                            """
+                            SELECT message_id, sender_user_id, recipient_user_id, nonce, ciphertext, aad, created_at
+                            FROM chat_messages
+                            WHERE org_id = ?
+                              AND ((sender_user_id = ? AND recipient_user_id = ?)
+                                OR (sender_user_id = ? AND recipient_user_id = ?))
+                              AND created_at > ?
+                            ORDER BY created_at ASC
+                            """,
+                            (org["org_id"], me["user_id"], peer_id, peer_id, me["user_id"], since),
+                        ).fetchall()
+                        out = [
+                            {
+                                "message_id": m["message_id"],
+                                "sender_user_id": m["sender_user_id"],
+                                "recipient_user_id": m["recipient_user_id"],
+                                "nonce_b64": base64.b64encode(bytes(m["nonce"])).decode("ascii"),
+                                "ct_b64": base64.b64encode(bytes(m["ciphertext"])).decode("ascii"),
+                                "aad_b64": base64.b64encode(bytes(m["aad"])).decode("ascii"),
+                                "created_at": m["created_at"],
+                            }
+                            for m in msgs
+                        ]
+                        self._send_json(200, out)
+                        return
+                self._send_json(404, {"error": "Not found"})
+            except ValueError:
+                self._send_json(400, {"error": "Invalid query parameter"})
+            except Exception:
+                self._send_json(500, {"error": "Internal error"})
 
         def do_POST(self) -> None:
             parsed = urllib.parse.urlparse(self.path)
+            ip = self._client_ip()
+            if not self._check_rate_limit(ip):
+                self._send_json(429, {"error": "Rate limit exceeded"})
+                return
             try:
                 body = self._read_json()
             except Exception:
                 self._send_json(400, {"error": "Invalid or oversized JSON payload"})
                 return
-            ip = self._client_ip()
-            with _connect(srv_db) as conn:
-                if parsed.path == "/api/use":
-                    cname = str(body.get("company_name", "")).strip()
-                    row = conn.execute(
-                        "SELECT * FROM organizations WHERE LOWER(name) = LOWER(?) ORDER BY created_at DESC LIMIT 1",
-                        (cname,),
-                    ).fetchone()
-                    if not row:
-                        self._send_json(404, {"error": f"Organization not found: {cname}"})
+            try:
+                with _connect(srv_db) as conn:
+                    if parsed.path == "/api/use":
+                        cname = str(body.get("company_name", "")).strip()
+                        row = conn.execute(
+                            "SELECT * FROM organizations WHERE LOWER(name) = LOWER(?) ORDER BY created_at DESC LIMIT 1",
+                            (cname,),
+                        ).fetchone()
+                        if not row:
+                            self._send_json(403, {"error": f"Device IP {ip} is not registered or organization unavailable"})
+                            return
+                        org = dict(row)
+                        usr = self._resolve_user_by_ip(conn, org["org_id"], ip)
+                        if not usr:
+                            self._send_json(403, {"error": f"Device IP {ip} is not registered in {org['name']}"})
+                            return
+                        label = f"({org['name']})" if usr["is_admin"] else f"({org['name']}:{usr['identifier']})"
+                        self._send_json(200, {"org_id": org["org_id"], "label": label})
                         return
-                    org = dict(row)
-                    usr = self._resolve_user_by_ip(conn, org["org_id"], ip)
-                    if not usr:
-                        self._send_json(403, {"error": f"Device IP {ip} is not registered in {org['name']}"})
+                    if parsed.path == "/api/chat/session":
+                        org = self._resolve_org(conn, str(body.get("org_id", "")))
+                        if not org:
+                            self._send_json(404, {"error": "Org not found"})
+                            return
+                        me = self._resolve_user_by_ip(conn, org["org_id"], ip)
+                        if not me:
+                            self._send_json(403, {"error": "Unauthorized"})
+                            return
+                        peer_id = str(body.get("peer_id", ""))
+                        peer_dev = conn.execute(
+                            "SELECT fingerprint FROM devices WHERE org_id = ? AND user_id = ? AND status = 'ACTIVE' LIMIT 1",
+                            (org["org_id"], peer_id),
+                        ).fetchone()
+                        if not peer_dev:
+                            self._send_json(404, {"error": "Peer not found"})
+                            return
+                        ses_id, ses_key = _get_or_create_pairwise_session(conn, org["org_id"], me["user_id"], peer_id)
+                        self._send_json(
+                            200,
+                            {
+                                "session_id": ses_id,
+                                "session_key_b64": base64.b64encode(ses_key).decode("ascii"),
+                                "peer_fingerprint": peer_dev["fingerprint"],
+                            },
+                        )
                         return
-                    label = f"({org['name']})" if usr["is_admin"] else f"({org['name']}:{usr['identifier']})"
-                    self._send_json(200, {"org_id": org["org_id"], "label": label})
-                    return
-                if parsed.path == "/api/chat/session":
-                    org = self._resolve_org(conn, str(body.get("org_id", "")))
-                    if not org:
-                        self._send_json(404, {"error": "Org not found"})
+                    if parsed.path == "/api/chat/send":
+                        org = self._resolve_org(conn, str(body.get("org_id", "")))
+                        if not org:
+                            self._send_json(404, {"error": "Org not found"})
+                            return
+                        me = self._resolve_user_by_ip(conn, org["org_id"], ip)
+                        if not me:
+                            self._send_json(403, {"error": "Unauthorized"})
+                            return
+                        peer_id = str(body.get("peer_id", ""))
+                        msg_id = str(body.get("message_id") or f"msg_{uuid.uuid4().hex[:12]}")
+                        ses_id = str(body.get("session_id") or "")
+                        seq_no = int(body.get("seq_no") or 1)
+                        nonce = base64.b64decode(str(body["nonce_b64"]), validate=True)
+                        ct = base64.b64decode(str(body["ct_b64"]), validate=True)
+                        aad = base64.b64decode(str(body["aad_b64"]), validate=True)
+                        if len(nonce) != 12 or len(ct) < 16 or not aad or seq_no < 1:
+                            self._send_json(400, {"error": "Invalid encrypted frame"})
+                            return
+                        with seq_lock:
+                            prev_seq = last_seq_by_sender.get((ses_id, me["user_id"]), 0)
+                            if seq_no <= prev_seq:
+                                self._send_json(409, {"error": "Replay or out-of-order sequence rejected"})
+                                return
+                            dup = conn.execute("SELECT 1 FROM chat_messages WHERE message_id = ?", (msg_id,)).fetchone()
+                            if dup:
+                                self._send_json(409, {"error": "Duplicate message_id rejected"})
+                                return
+                            last_seq_by_sender[(ses_id, me["user_id"])] = seq_no
+                        conn.execute(
+                            """
+                            INSERT INTO chat_messages (
+                                message_id, org_id, sender_user_id, recipient_user_id,
+                                session_id, seq_no, nonce, ciphertext, aad, created_at
+                            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            """,
+                            (msg_id, org["org_id"], me["user_id"], peer_id, ses_id, seq_no, nonce, ct, aad, time.time()),
+                        )
+                        conn.commit()
+                        _audit_logger(org).append_entry(me["user_id"], "CHAT_SEND", peer_id, "allow")
+                        self._send_json(200, {"sent": True, "message_id": msg_id})
                         return
-                    me = self._resolve_user_by_ip(conn, org["org_id"], ip)
-                    if not me:
-                        self._send_json(403, {"error": "Unauthorized"})
-                        return
-                    peer_id = str(body.get("peer_id", ""))
-                    peer_dev = conn.execute(
-                        "SELECT fingerprint FROM devices WHERE org_id = ? AND user_id = ? AND status = 'ACTIVE' LIMIT 1",
-                        (org["org_id"], peer_id),
-                    ).fetchone()
-                    if not peer_dev:
-                        self._send_json(404, {"error": "Peer not found"})
-                        return
-                    ses_id, ses_key = _get_or_create_pairwise_session(conn, org["org_id"], me["user_id"], peer_id)
-                    self._send_json(
-                        200,
-                        {
-                            "session_id": ses_id,
-                            "session_key_b64": base64.b64encode(ses_key).decode("ascii"),
-                            "peer_fingerprint": peer_dev["fingerprint"],
-                        },
-                    )
-                    return
-                if parsed.path == "/api/chat/send":
-                    org = self._resolve_org(conn, str(body.get("org_id", "")))
-                    if not org:
-                        self._send_json(404, {"error": "Org not found"})
-                        return
-                    me = self._resolve_user_by_ip(conn, org["org_id"], ip)
-                    if not me:
-                        self._send_json(403, {"error": "Unauthorized"})
-                        return
-                    peer_id = str(body.get("peer_id", ""))
-                    msg_id = str(body.get("message_id") or f"msg_{uuid.uuid4().hex[:12]}")
-                    ses_id = str(body.get("session_id") or "")
-                    seq_no = int(body.get("seq_no") or 1)
-                    nonce = base64.b64decode(str(body["nonce_b64"]))
-                    ct = base64.b64decode(str(body["ct_b64"]))
-                    aad = base64.b64decode(str(body["aad_b64"]))
-                    conn.execute(
-                        """
-                        INSERT INTO chat_messages (
-                            message_id, org_id, sender_user_id, recipient_user_id,
-                            session_id, seq_no, nonce, ciphertext, aad, created_at
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                        """,
-                        (msg_id, org["org_id"], me["user_id"], peer_id, ses_id, seq_no, nonce, ct, aad, time.time()),
-                    )
-                    conn.commit()
-                    _audit_logger(org).append_entry(me["user_id"], "CHAT_SEND", peer_id, "allow")
-                    self._send_json(200, {"sent": True, "message_id": msg_id})
-                    return
-            self._send_json(404, {"error": "Not found"})
+                self._send_json(404, {"error": "Not found"})
+            except (ValueError, KeyError, TypeError):
+                self._send_json(400, {"error": "Malformed request"})
+            except Exception:
+                self._send_json(500, {"error": "Internal error"})
 
     return GravitonHandler
 
