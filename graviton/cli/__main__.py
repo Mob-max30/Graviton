@@ -21,6 +21,8 @@ from graviton.lifecycle import BackupVerificationError, verify_and_load_backup
 from graviton.net.protocol import DEFAULT_MAX_FRAME_BYTES
 from graviton.nodes import Node
 from graviton.probe import run_revocation_probe
+from graviton.redteam import run_redteam_scenario
+from graviton.sentinel import SentinelRunner, load_alerts, verify_node_audits
 
 
 def _parse_host_port(spec: str) -> tuple[str, int]:
@@ -148,6 +150,26 @@ def main(argv: list[str] | None = None) -> int:
 
     sub.add_parser("detect-eval", help="Run deterministic detection evaluation")
     sub.add_parser("bench", help="Run unified benchmark suite")
+
+    p_sent = sub.add_parser("sentinel", help="Run live security sentinel")
+    sent_sub = p_sent.add_subparsers(dest="sentinel_cmd", required=True)
+    ps_run = sent_sub.add_parser("run", help="Pull audit logs from nodes and run live detection")
+    ps_run.add_argument("--interval", type=float, default=1.0)
+    ps_run.add_argument("--once", action="store_true")
+
+    p_alerts = sub.add_parser("alerts", help="Show emitted sentinel alerts")
+    p_alerts.add_argument("--follow", action="store_true")
+
+    p_aud = sub.add_parser("audit", help="Audit log operations")
+    aud_sub = p_aud.add_subparsers(dest="audit_cmd", required=True)
+    pa_ver = aud_sub.add_parser("verify", help="Verify hash chain and checkpoints for node dirs")
+    pa_ver.add_argument("--cluster-dir", type=Path, default=None)
+    pa_ver.add_argument("--dir", action="append", type=Path, default=[])
+
+    p_rt = sub.add_parser("redteam", help="Run red-team verification scenarios against live node")
+    p_rt.add_argument("scenario", help="Scenario name or 'all'")
+    p_rt.add_argument("--target", required=True, help="HOST:PORT (loopback only)")
+    p_rt.add_argument("--confirm-non-loopback", action="store_true")
 
     args = parser.parse_args(argv)
 
@@ -441,6 +463,67 @@ def main(argv: list[str] | None = None) -> int:
         r = run_benchmarks(iterations=10)
         print(f"Detection F1={r['detection']['f1']} Revocation last_node_ms={r['revocation']['last_node_enforcement_ms']}")
         return 0
+
+    if args.command == "sentinel" and args.sentinel_cmd == "run":
+        import time as _time
+
+        mgr = AdminManager()
+        st = mgr._load_state()
+        pw = read_passphrase("Admin keystore passphrase: ")
+        _, _, admin_sk = load_keystore(mgr.keystore_path, pw)
+        runner = SentinelRunner(operators={st.get("operator_handle", "kavya"), "admin"})
+        while True:
+            runner.pull_and_analyze(
+                st.get("nodes", []),
+                st.get("operator_handle", "kavya"),
+                "admin-dev",
+                1,
+                admin_sk,
+            )
+            if args.once:
+                break
+            _time.sleep(args.interval)
+        return 0
+
+    if args.command == "alerts":
+        import time as _time
+
+        runner = SentinelRunner()
+        seen = 0
+        while True:
+            items = load_alerts(runner.alerts_path)
+            for al in items[seen:]:
+                print(json.dumps(al, separators=(",", ":")))
+            seen = len(items)
+            if not args.follow:
+                break
+            _time.sleep(0.5)
+        return 0
+
+    if args.command == "audit" and args.audit_cmd == "verify":
+        import json as _json
+
+        dirs = list(args.dir)
+        if args.cluster_dir is not None:
+            cinfo = _json.loads((args.cluster_dir / "cluster.json").read_text(encoding="utf-8"))
+            dirs.extend(Path(n["dir"]) for n in cinfo.get("nodes", []))
+        results = verify_node_audits(dirs)
+        ok = all(r["valid"] for r in results)
+        for r in results:
+            print(f"{r['node_dir']}: valid={r['valid']} events={r['event_count']} head_seq={r['head_seq']}")
+        return 0 if ok else 1
+
+    if args.command == "redteam":
+        host, port = _parse_host_port(args.target)
+        res = run_redteam_scenario(
+            args.scenario,
+            host,
+            port,
+            confirm_non_loopback=args.confirm_non_loopback,
+        )
+        for item in res:
+            print(f"[{item['scenario']}] denied={item['denied']} node_alive={item['node_alive']} {item['detail']}")
+        return 0 if all(item["denied"] and item["node_alive"] for item in res) else 1
 
     return 2
 

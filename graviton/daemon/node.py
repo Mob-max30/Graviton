@@ -27,6 +27,7 @@ from graviton.net.protocol import (
     MSG_JOIN_REQUEST,
     MSG_REQUEST,
     OP_ACK,
+    OP_AUDIT_PULL,
     OP_FEED_PULL,
     OP_FETCH_ENVELOPE,
     OP_GET_CHUNK,
@@ -486,13 +487,28 @@ class NodeDaemon:
                 )
                 return self._sign_response(body, req.seq, STATUS_BAD_REQUEST, b""), False
 
-        if req.op in (OP_INVITE_CREATE, OP_JOIN_LIST, OP_JOIN_RESOLVE):
+        if req.op in (OP_INVITE_CREATE, OP_JOIN_LIST, OP_JOIN_RESOLVE, OP_AUDIT_PULL):
             if req.actor not in self.operators:
                 self._audit_event(
                     req.actor, service, f"OP_{req.op}", "deny", "OPERATOR_REQUIRED",
                     device_id=req.device_id, req_hash=req_hash,
                 )
                 return self._sign_response(body, req.seq, STATUS_DENIED, b""), False
+
+            if req.op == OP_AUDIT_PULL:
+                try:
+                    data = json.loads(req.payload.decode("utf-8")) if req.payload else {}
+                    since_seq = int(data.get("since_seq", 0))
+                except Exception:
+                    return self._sign_response(body, req.seq, STATUS_BAD_REQUEST, b""), False
+                events = [e for e in self.audit.fetch_events() if int(e["seq"]) > since_seq]
+                self._audit_event(
+                    req.actor, service, "AUDIT_PULL", "allow", f"count={len(events)}",
+                    device_id=req.device_id, req_hash=req_hash,
+                )
+                return self._sign_response(
+                    body, req.seq, STATUS_OK, json.dumps(events, separators=(",", ":")).encode("utf-8")
+                ), False
 
             if req.op == OP_INVITE_CREATE:
                 try:

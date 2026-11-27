@@ -11,6 +11,7 @@ from graviton.net.protocol import (
     DEFAULT_MAX_FRAME_BYTES,
     JOIN_SIGN_DOMAIN,
     OP_ACK,
+    OP_AUDIT_PULL,
     OP_FEED_PULL,
     OP_FETCH_ENVELOPE,
     OP_GET_CHUNK,
@@ -344,4 +345,19 @@ class NodeClient:
         resp = self.send_request(actor, device_id, key_version, signing_sk, OP_GET_CHUNK, body)
         if resp.status != 0:
             raise NodeClientError(f"GET_CHUNK denied (status={resp.status})")
+        return json.loads(resp.payload.decode("utf-8"))
+
+    def audit_pull(
+        self,
+        actor: str,
+        device_id: str,
+        key_version: int,
+        signing_sk: bytes,
+        *,
+        since_seq: int = 0,
+    ) -> list[dict]:
+        body = json.dumps({"since_seq": since_seq}, separators=(",", ":")).encode("utf-8")
+        resp = self.send_request(actor, device_id, key_version, signing_sk, OP_AUDIT_PULL, body)
+        if resp.status != 0:
+            raise NodeClientError(f"AUDIT_PULL denied (status={resp.status})")
         return json.loads(resp.payload.decode("utf-8"))
