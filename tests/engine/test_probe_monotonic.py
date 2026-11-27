@@ -8,7 +8,7 @@ from graviton import probe
 
 
 class TestProbeMonotonicAndLastNode(unittest.TestCase):
-    def test_probe_uses_monotonic_clock_and_tracks_last_node(self) -> None:
+    def test_probe_uses_monotonic_clock_and_tracks_last_node(self) -> None: 
         src = inspect.getsource(probe.probe_revocation_once)
         self.assertIn("monotonic_ns", src)
         self.assertNotIn("time.time()", src)
