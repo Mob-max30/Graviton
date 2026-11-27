@@ -31,9 +31,3 @@ py-modules = ["graviton_cli", "team_app", "track4_service"]
 
 [tool.setuptools.packages.find]
 include = ["trustledger*"]
-
-[tool.pytest.ini_options]
-minversion = "7.0"
-addopts = "-q --timeout=30"
-testpaths = ["tests"]
-pythonpath = ["."]
