@@ -43,6 +43,7 @@ def cluster_up(
     *,
     sync_interval_s: float = 0.2,
     initial_entries: list[bytes] | None = None,
+    operators: list[str] | None = None,
 ) -> dict:
     """Start N real node OS processes on ephemeral ports and write cluster.json."""
     if node_count < 1:
@@ -74,6 +75,8 @@ def cluster_up(
             "--ready-file",
             str(ready_file),
         ]
+        for op_name in (operators if operators is not None else ["kavya", "admin"]):
+            cmd.extend(["--operator", op_name])
         if idx > 0:
             cmd.extend(["--upstream", f"{hub_host}:{hub_port}", "--sync-interval", str(sync_interval_s)])
 

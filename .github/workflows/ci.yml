@@ -65,7 +65,18 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt cryptography==50.0.2
 
-      - name: Run Stage 1, 3, and 4 engine tests on Linux
+      - name: Run Stage 1, 3, 4, 5, and 6 engine tests on Linux
         working-directory: Graviton
         run: |
-          python -m unittest tests/engine/test_stage1_node_daemon.py tests/engine/test_stage3_membership.py tests/engine/test_stage4_data_plane.py tests/engine/test_stage5_sentinel_redteam.py -v
+          python -m unittest tests/engine/test_stage1_node_daemon.py tests/engine/test_stage3_membership.py tests/engine/test_stage4_data_plane.py tests/engine/test_stage5_sentinel_redteam.py tests/engine/test_stage6_packaging_demo.py -v
+
+      - name: Run 30-run revocation probe and upload artifact
+        working-directory: Graviton
+        run: |
+          python -c "import base64, json, tempfile; from pathlib import Path; from graviton.admin import AdminManager; from graviton.cluster import cluster_up, cluster_down; from graviton.crypto.keystore import load_keystore; from graviton.probe import run_revocation_probe; tmp = Path(tempfile.mkdtemp()); adm = AdminManager(tmp/'adm'); g = adm.init_group('ci-probe', 'ci-pass'); apk = base64.b64decode(adm._load_state()['admin_pk_b64']); c = cluster_up(tmp/'cls', 3, g['feed_id'], apk, sync_interval_s=0.1, initial_entries=[bytes.fromhex(h) for h in adm._load_state()['entries_hex']]); _, _, ask = load_keystore(adm.keystore_path, 'ci-pass'); res = run_revocation_probe(c, ask, runs=30, poll_interval_s=0.05); Path('probe_results.json').write_text(json.dumps(res, indent=2)); cluster_down(tmp/'cls')"
+
+      - name: Upload probe results artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: revocation-probe-results
+          path: Graviton/probe_results.json

@@ -16,7 +16,9 @@ from graviton.cluster import cluster_down, cluster_status, cluster_up
 from graviton.crypto.aead import AeadUnavailableError, aead_available
 from graviton.crypto.keystore import load_keystore
 from graviton.daemon.node import init_node_daemon, run_node_cli
+from graviton.demo import run_demo
 from graviton.detect import evaluate_detection
+from graviton.doctor import run_doctor
 from graviton.lifecycle import BackupVerificationError, verify_and_load_backup
 from graviton.net.protocol import DEFAULT_MAX_FRAME_BYTES
 from graviton.nodes import Node
@@ -170,6 +172,9 @@ def main(argv: list[str] | None = None) -> int:
     p_rt.add_argument("scenario", help="Scenario name or 'all'")
     p_rt.add_argument("--target", required=True, help="HOST:PORT (loopback only)")
     p_rt.add_argument("--confirm-non-loopback", action="store_true")
+
+    sub.add_parser("doctor", help="Self-check Python, pqcrypto, AEAD, SQLite RETURNING, state dir, and ports")
+    sub.add_parser("demo", help="Run real multi-node end-to-end demonstration scenario")
 
     args = parser.parse_args(argv)
 
@@ -524,6 +529,24 @@ def main(argv: list[str] | None = None) -> int:
         for item in res:
             print(f"[{item['scenario']}] denied={item['denied']} node_alive={item['node_alive']} {item['detail']}")
         return 0 if all(item["denied"] and item["node_alive"] for item in res) else 1
+
+    if args.command == "doctor":
+        checks = run_doctor()
+        core_ok = True
+        for c in checks:
+            status = "PASS" if c["ok"] else ("WARN" if c["name"] == "aead_extra" else "FAIL")
+            print(f"[{status}] {c['name']}: {c['detail']} -> {c['action']}")
+            if not c["ok"] and c["name"] != "aead_extra":
+                core_ok = False
+        return 0 if core_ok else 1
+
+    if args.command == "demo":
+        try:
+            run_demo()
+            return 0
+        except AeadUnavailableError as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            return 1
 
     return 2
 

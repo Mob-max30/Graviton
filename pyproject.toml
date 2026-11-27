@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "graviton-sec"
+version = "0.1.0"
+description = "Post-quantum zero-trust group policy, tamper-evident audit, and E2EE messaging engine"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "pqcrypto==0.4.0",
+]
+
+[project.optional-dependencies]
+app = [
+    "cryptography==50.0.2",
+]
+
+[project.scripts]
+graviton = "graviton.cli.__main__:main"
+
+[tool.setuptools.packages.find]
+include = ["graviton*"]
