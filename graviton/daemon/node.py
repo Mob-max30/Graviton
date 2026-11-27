@@ -3,12 +3,15 @@ from __future__ import annotations
 
 import base64
 from collections import defaultdict, deque
+from contextlib import closing
 import hashlib
+import hmac
 import json
 from pathlib import Path
 import secrets
 import signal
 import socket
+import sqlite3
 import ssl
 import sys
 import threading
@@ -19,9 +22,14 @@ from graviton.crypto.signatures import generate_signing_keypair, sign_message, v
 from graviton.feed.encoding import Reader
 from graviton.net.protocol import (
     DEFAULT_MAX_FRAME_BYTES,
+    JOIN_SIGN_DOMAIN,
     MSG_FEED_PUSH,
+    MSG_JOIN_REQUEST,
     MSG_REQUEST,
     OP_FEED_PULL,
+    OP_INVITE_CREATE,
+    OP_JOIN_LIST,
+    OP_JOIN_RESOLVE,
     OP_STATUS,
     PROTO_VERSION,
     REQUEST_SIGN_DOMAIN,
@@ -35,10 +43,12 @@ from graviton.net.protocol import (
     ProtocolError,
     ResponseMessage,
     decode_feed_push,
+    decode_join_request,
     decode_request,
     encode_hello,
     encode_response,
     format_fingerprint,
+    join_signing_bytes,
     public_key_fingerprint_bytes,
     read_frame,
     request_signing_bytes,
@@ -154,6 +164,8 @@ class NodeDaemon:
 
         self.node = Node(self.node_dir, freshness_window=None)
         self.audit = AuditLog(self.node_dir / "audit.db", self.node_dir / "audit_head.json")
+        self.db_path = self.node_dir / "relay_vault.db"
+        self._init_db()
 
         self._source_limiter = _RateLimiter(*source_rate)
         self._identity_limiter = _RateLimiter(*identity_rate)
@@ -165,6 +177,34 @@ class NodeDaemon:
             ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
             ctx.load_cert_chain(certfile=tls_cert, keyfile=tls_key)
             self._ssl_ctx = ctx
+
+    def _connect_db(self):
+        conn = sqlite3.connect(str(self.db_path), timeout=10.0, isolation_level=None)
+        conn.row_factory = sqlite3.Row
+        return closing(conn)
+
+    def _init_db(self) -> None:
+        with self._connect_db() as conn:
+            conn.executescript(
+                """
+                CREATE TABLE IF NOT EXISTS invites (
+                    invite_id TEXT PRIMARY KEY,
+                    secret_sha256 TEXT NOT NULL,
+                    handle_hint TEXT NOT NULL,
+                    expires_at INTEGER NOT NULL,
+                    used INTEGER NOT NULL DEFAULT 0
+                );
+                CREATE TABLE IF NOT EXISTS pending_joins (
+                    invite_id TEXT PRIMARY KEY,
+                    handle TEXT NOT NULL,
+                    device_id TEXT NOT NULL,
+                    device_pk_b64 TEXT NOT NULL,
+                    device_fp TEXT NOT NULL,
+                    received_at INTEGER NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'PENDING'
+                );
+                """
+            )
 
     def _audit_event(
         self,
@@ -236,6 +276,73 @@ class NodeDaemon:
             req_hash=req_hash,
         )
         payload = json.dumps({"applied": applied, "statuses": statuses}, separators=(",", ":")).encode("utf-8")
+        return self._sign_response(body, 0, STATUS_OK, payload)
+
+    def _handle_join_request(self, body: bytes) -> bytes:
+        req_hash = hashlib.sha256(body).hexdigest()[:16]
+        try:
+            jr = decode_join_request(body, max_len=self.max_frame_bytes)
+        except ProtocolError as exc:
+            self._audit_event("join-anon", "directory", "JOIN_REQUEST", "deny", str(exc), req_hash=req_hash)
+            return self._sign_response(body, 0, STATUS_BAD_REQUEST, b"")
+
+        pop_msg = join_signing_bytes(
+            jr["invite_id"], jr["invite_secret"], jr["handle"], jr["device_id"], jr["device_pk"]
+        )
+        if not verify_signature(jr["device_pk"], pop_msg, jr["pop_sig"], domain=JOIN_SIGN_DOMAIN):
+            self._audit_event(
+                jr["handle"], "directory", "JOIN_REQUEST", "deny", "INVALID_POP_SIGNATURE",
+                device_id=jr["device_id"], req_hash=req_hash,
+            )
+            return self._sign_response(body, 0, STATUS_DENIED, b"")
+
+        now = int(time.time())
+        secret_hash = hashlib.sha256(jr["invite_secret"]).hexdigest()
+        fp = format_fingerprint(jr["device_pk"])
+        pk_b64 = base64.b64encode(jr["device_pk"]).decode("ascii")
+
+        with self._connect_db() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                row = conn.execute(
+                    "SELECT secret_sha256, expires_at, used FROM invites WHERE invite_id = ?",
+                    (jr["invite_id"],),
+                ).fetchone()
+                if row is None:
+                    conn.execute("ROLLBACK")
+                    self._audit_event(jr["handle"], "directory", "JOIN_REQUEST", "deny", "UNKNOWN_INVITE", req_hash=req_hash)
+                    return self._sign_response(body, 0, STATUS_DENIED, b"")
+                if int(row["used"]) != 0:
+                    conn.execute("ROLLBACK")
+                    self._audit_event(jr["handle"], "directory", "JOIN_REQUEST", "deny", "INVITE_REUSED", req_hash=req_hash)
+                    return self._sign_response(body, 0, STATUS_DENIED, b"")
+                if now >= int(row["expires_at"]):
+                    conn.execute("ROLLBACK")
+                    self._audit_event(jr["handle"], "directory", "JOIN_REQUEST", "deny", "INVITE_EXPIRED", req_hash=req_hash)
+                    return self._sign_response(body, 0, STATUS_DENIED, b"")
+                if not hmac.compare_digest(row["secret_sha256"], secret_hash):
+                    conn.execute("ROLLBACK")
+                    self._audit_event(jr["handle"], "directory", "JOIN_REQUEST", "deny", "INVITE_BAD_SECRET", req_hash=req_hash)
+                    return self._sign_response(body, 0, STATUS_DENIED, b"")
+
+                conn.execute("UPDATE invites SET used = 1 WHERE invite_id = ?", (jr["invite_id"],))
+                conn.execute(
+                    """
+                    INSERT INTO pending_joins (invite_id, handle, device_id, device_pk_b64, device_fp, received_at, status)
+                    VALUES (?, ?, ?, ?, ?, ?, 'PENDING')
+                    """,
+                    (jr["invite_id"], jr["handle"], jr["device_id"], pk_b64, fp, now),
+                )
+                conn.execute("COMMIT")
+            except Exception:
+                conn.execute("ROLLBACK")
+                raise
+
+        self._audit_event(
+            jr["handle"], "directory", "JOIN_REQUEST", "allow", f"pending_fp={fp}",
+            device_id=jr["device_id"], req_hash=req_hash,
+        )
+        payload = json.dumps({"status": "pending", "device_fp": fp}, separators=(",", ":")).encode("utf-8")
         return self._sign_response(body, 0, STATUS_OK, payload)
 
     def _handle_request(self, body: bytes, feed_id: str, server_nonce: bytes, expected_seq: int) -> tuple[bytes, bool]:
@@ -327,6 +434,59 @@ class NodeDaemon:
                 )
                 return self._sign_response(body, req.seq, STATUS_BAD_REQUEST, b""), False
 
+        if req.op in (OP_INVITE_CREATE, OP_JOIN_LIST, OP_JOIN_RESOLVE):
+            if req.actor not in self.operators:
+                self._audit_event(
+                    req.actor, service, f"OP_{req.op}", "deny", "OPERATOR_REQUIRED",
+                    device_id=req.device_id, req_hash=req_hash,
+                )
+                return self._sign_response(body, req.seq, STATUS_DENIED, b""), False
+
+            if req.op == OP_INVITE_CREATE:
+                try:
+                    data = json.loads(req.payload.decode("utf-8"))
+                    inv_id = str(data["invite_id"])
+                    sec_sha = str(data["secret_sha256"])
+                    hint = str(data["handle_hint"])
+                    exp = int(data["expires_at"])
+                except Exception:
+                    return self._sign_response(body, req.seq, STATUS_BAD_REQUEST, b""), False
+                with self._connect_db() as conn:
+                    conn.execute("BEGIN IMMEDIATE")
+                    conn.execute(
+                        "INSERT INTO invites (invite_id, secret_sha256, handle_hint, expires_at, used) VALUES (?, ?, ?, ?, 0)",
+                        (inv_id, sec_sha, hint, exp),
+                    )
+                    conn.execute("COMMIT")
+                self._audit_event(req.actor, service, "INVITE_CREATE", "allow", f"for={hint}", device_id=req.device_id, req_hash=req_hash)
+                return self._sign_response(body, req.seq, STATUS_OK, b'{"created":true}'), False
+
+            if req.op == OP_JOIN_LIST:
+                with self._connect_db() as conn:
+                    rows = conn.execute(
+                        "SELECT invite_id, handle, device_id, device_pk_b64, device_fp, received_at, status "
+                        "FROM pending_joins WHERE status = 'PENDING' ORDER BY received_at ASC"
+                    ).fetchall()
+                items = [dict(r) for r in rows]
+                self._audit_event(req.actor, service, "JOIN_LIST", "allow", f"count={len(items)}", device_id=req.device_id, req_hash=req_hash)
+                return self._sign_response(body, req.seq, STATUS_OK, json.dumps(items, separators=(",", ":")).encode("utf-8")), False
+
+            if req.op == OP_JOIN_RESOLVE:
+                try:
+                    data = json.loads(req.payload.decode("utf-8"))
+                    inv_id = str(data["invite_id"])
+                    new_status = str(data["status"])
+                    if new_status not in ("APPROVED", "REJECTED"):
+                        raise ValueError("Invalid status")
+                except Exception:
+                    return self._sign_response(body, req.seq, STATUS_BAD_REQUEST, b""), False
+                with self._connect_db() as conn:
+                    conn.execute("BEGIN IMMEDIATE")
+                    conn.execute("UPDATE pending_joins SET status = ? WHERE invite_id = ?", (new_status, inv_id))
+                    conn.execute("COMMIT")
+                self._audit_event(req.actor, service, "JOIN_RESOLVE", "allow", f"{inv_id}:{new_status}", device_id=req.device_id, req_hash=req_hash)
+                return self._sign_response(body, req.seq, STATUS_OK, b'{"resolved":true}'), False
+
         self._audit_event(
             req.actor, service, f"OP_{req.op}", "deny", "UNSUPPORTED_OP",
             device_id=req.device_id, req_hash=req_hash,
@@ -369,6 +529,9 @@ class NodeDaemon:
                 msg_type = body[1]
                 if msg_type == MSG_FEED_PUSH:
                     resp = self._handle_feed_push(body, peer_ip)
+                    write_frame(conn, resp, max_frame_bytes=self.max_frame_bytes)
+                elif msg_type == MSG_JOIN_REQUEST:
+                    resp = self._handle_join_request(body)
                     write_frame(conn, resp, max_frame_bytes=self.max_frame_bytes)
                 elif msg_type == MSG_REQUEST:
                     resp, close_after = self._handle_request(body, feed_id, server_nonce, expected_seq)

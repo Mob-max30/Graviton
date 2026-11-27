@@ -37,6 +37,7 @@ OP_GET_CHUNK = 21
 OP_AUDIT_PULL = 30
 OP_JOIN_LIST = 31
 OP_JOIN_RESOLVE = 32
+OP_INVITE_CREATE = 33
 
 SERVICE_BY_OP: dict[int, str] = {
     OP_STATUS: "directory",
@@ -50,6 +51,7 @@ SERVICE_BY_OP: dict[int, str] = {
     OP_AUDIT_PULL: "admin",
     OP_JOIN_LIST: "admin",
     OP_JOIN_RESOLVE: "admin",
+    OP_INVITE_CREATE: "admin",
 }
 
 STATUS_OK = 0

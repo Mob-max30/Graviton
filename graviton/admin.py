@@ -3,10 +3,13 @@ from __future__ import annotations
 
 import base64
 import getpass
+import hashlib
 import json
 import os
 from pathlib import Path
 import secrets
+import time
+from typing import Callable
 
 from graviton.crypto.aead import AeadUnavailableError, aead_available
 from graviton.crypto.keystore import KeystoreError, load_keystore, save_keystore
@@ -84,7 +87,9 @@ class AdminManager:
         state["entries_hex"].append(raw_entry.hex())
         self._save_state(state)
 
-    def init_group(self, group_name: str, passphrase: str) -> dict:
+    def init_group(
+        self, group_name: str, passphrase: str, *, operator_handle: str = "kavya"
+    ) -> dict:
         self._require_aead()
         ensure_state_dir(self.admin_dir)
         admin_pk, admin_sk = generate_signing_keypair()
@@ -93,24 +98,27 @@ class AdminManager:
 
         author = FeedAuthor(feed_id, admin_sk)
         genesis = author.genesis()
+        reg_op = author.register_key(operator_handle, "admin-dev", admin_pk)
         state = {
             "version": 1,
             "group_name": group_name,
+            "operator_handle": operator_handle,
             "feed_id": feed_id,
             "admin_pk_b64": base64.b64encode(admin_pk).decode("ascii"),
             "epoch": author.epoch,
             "last_hash_hex": author.last_hash.hex(),
-            "entries_hex": [genesis.hex()],
+            "entries_hex": [genesis.hex(), reg_op.hex()],
             "nodes": [],
         }
         self._save_state(state)
         return {
             "group_name": group_name,
+            "operator_handle": operator_handle,
             "feed_id": feed_id,
             "fingerprint": format_fingerprint(admin_pk),
         }
 
-    def add_node(self, host: str, port: int) -> dict:
+    def add_node(self, host: str, port: int, *, node_pk_b64: str = "") -> dict:
         state = self._load_state()
         with NodeClient(host, port) as cli:
             assert cli.hello is not None
@@ -120,9 +128,122 @@ class AdminManager:
 
         existing = [n for n in state["nodes"] if n["host"] == host and n["port"] == port]
         if not existing:
-            state["nodes"].append({"host": host, "port": port, "node_id": node_id})
+            state["nodes"].append(
+                {"host": host, "port": port, "node_id": node_id, "node_pk_b64": node_pk_b64}
+            )
             self._save_state(state)
         return {"node_id": node_id, "host": host, "port": port, "push": push_res}
+
+    @staticmethod
+    def parse_ttl(ttl: str) -> int:
+        s = ttl.strip().lower()
+        if s.endswith("m"):
+            return int(s[:-1]) * 60
+        if s.endswith("h"):
+            return int(s[:-1]) * 3600
+        if s.endswith("s"):
+            return int(s[:-1])
+        return int(s)
+
+    def create_invite(
+        self, handle_hint: str, ttl_s: int, out_path: str | Path, passphrase: str
+    ) -> dict:
+        author, state, admin_pk = self._load_author(passphrase)
+        if not state["nodes"]:
+            raise RuntimeError("No hub node registered; run 'graviton admin add-node' first")
+        hub = state["nodes"][0]
+        invite_id = "inv-" + secrets.token_hex(8)
+        invite_secret = secrets.token_bytes(32)
+        secret_sha256 = hashlib.sha256(invite_secret).hexdigest()
+        expires_at = int(time.time()) + ttl_s
+        op_handle = state.get("operator_handle", "kavya")
+
+        with NodeClient(hub["host"], int(hub["port"])) as cli:
+            assert cli.hello is not None
+            cli.create_invite(
+                op_handle,
+                "admin-dev",
+                1,
+                author._admin_secret_key,
+                invite_id,
+                secret_sha256,
+                handle_hint,
+                expires_at,
+            )
+            # Also learn hub's public key if saved in cluster or node_dir; for invite include node_pk_b64 if known
+            hub_pk_b64 = hub.get("node_pk_b64", "")
+            hub_fp = format_fingerprint(base64.b64decode(hub_pk_b64)) if hub_pk_b64 else ""
+
+        invite_doc = {
+            "version": 1,
+            "invite_id": invite_id,
+            "invite_secret_b64": base64.b64encode(invite_secret).decode("ascii"),
+            "feed_id": state["feed_id"],
+            "admin_pk_b64": state["admin_pk_b64"],
+            "admin_fp": format_fingerprint(admin_pk),
+            "hub_host": hub["host"],
+            "hub_port": int(hub["port"]),
+            "hub_node_pk_b64": hub_pk_b64,
+            "hub_node_fp": hub_fp,
+            "expires_at": expires_at,
+        }
+        atomic_write_text(Path(out_path), json.dumps(invite_doc, indent=2))
+        return invite_doc
+
+    def pending_joins(self, passphrase: str) -> list[dict]:
+        author, state, _ = self._load_author(passphrase)
+        hub = state["nodes"][0]
+        op_handle = state.get("operator_handle", "kavya")
+        with NodeClient(hub["host"], int(hub["port"])) as cli:
+            return cli.join_list(op_handle, "admin-dev", 1, author._admin_secret_key)
+
+    def approve_join(
+        self,
+        handle: str,
+        passphrase: str,
+        *,
+        confirm_fn: Callable[[str], bool] | None = None,
+    ) -> dict:
+        author, state, _ = self._load_author(passphrase)
+        hub = state["nodes"][0]
+        op_handle = state.get("operator_handle", "kavya")
+        with NodeClient(hub["host"], int(hub["port"])) as cli:
+            pending = cli.join_list(op_handle, "admin-dev", 1, author._admin_secret_key)
+        matches = [p for p in pending if p["handle"] == handle]
+        if not matches:
+            raise RuntimeError(f"No pending join request for handle '{handle}'")
+        req = matches[-1]
+        fp = req["device_fp"]
+        if confirm_fn is not None:
+            ok = confirm_fn(fp)
+        else:
+            ok = input(
+                f"Device fingerprint for '{handle}' ({req['device_id']}): {fp}\n"
+                "Confirm this matches out-of-band [y/N]: "
+            ).strip().lower() in ("y", "yes")
+        if not ok:
+            raise PermissionError("Aborted: device fingerprint not confirmed out-of-band")
+
+        dev_pk = base64.b64decode(req["device_pk_b64"], validate=True)
+        raw = author.register_key(req["handle"], req["device_id"], dev_pk)
+        self._commit_entry(author, state, raw)
+        push_res = self.push_all()
+        with NodeClient(hub["host"], int(hub["port"])) as cli:
+            cli.join_resolve(op_handle, "admin-dev", 1, author._admin_secret_key, req["invite_id"], "APPROVED")
+        return {"handle": req["handle"], "device_id": req["device_id"], "device_fp": fp, "push": push_res}
+
+    def reject_join(self, handle: str, passphrase: str) -> dict:
+        author, state, _ = self._load_author(passphrase)
+        hub = state["nodes"][0]
+        op_handle = state.get("operator_handle", "kavya")
+        with NodeClient(hub["host"], int(hub["port"])) as cli:
+            pending = cli.join_list(op_handle, "admin-dev", 1, author._admin_secret_key)
+            matches = [p for p in pending if p["handle"] == handle]
+            if not matches:
+                raise RuntimeError(f"No pending join request for handle '{handle}'")
+            req = matches[-1]
+            cli.join_resolve(op_handle, "admin-dev", 1, author._admin_secret_key, req["invite_id"], "REJECTED")
+        return {"handle": handle, "status": "REJECTED"}
 
     def push_all(self) -> list[dict]:
         state = self._load_state()

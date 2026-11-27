@@ -9,6 +9,7 @@ import sys
 from graviton.admin import AdminManager, read_passphrase
 from graviton.audit import AuditLog
 from graviton.bench.suite import run_benchmarks
+from graviton.client import ClientManager
 from graviton.cluster import cluster_down, cluster_status, cluster_up
 from graviton.crypto.keystore import load_keystore
 from graviton.daemon.node import init_node_daemon, run_node_cli
@@ -53,12 +54,28 @@ def main(argv: list[str] | None = None) -> int:
     pn_stat = node_sub.add_parser("status", help="Inspect local node state")
     pn_stat.add_argument("--dir", required=True, type=Path)
 
+    p_init_m = sub.add_parser("init", help="Initialise member identity and device keystore")
+    p_init_m.add_argument("--handle", required=True)
+    sub.add_parser("identity", help="Show member handle, device ID, and fingerprint")
+    p_join = sub.add_parser("join", help="Join a group using an invite file")
+    p_join.add_argument("invite_file", type=Path)
+
     p_adm = sub.add_parser("admin", help="Group admin commands (uses scrypt keystore)")
     adm_sub = p_adm.add_subparsers(dest="admin_cmd", required=True)
     pa_init = adm_sub.add_parser("init", help="Create a new group and admin keystore")
     pa_init.add_argument("--group", required=True)
+    pa_init.add_argument("--operator", default="kavya")
     pa_add = adm_sub.add_parser("add-node", help="Register a node HOST:PORT and push feed")
     pa_add.add_argument("endpoint")
+    pa_inv = adm_sub.add_parser("invite", help="Create a single-use expiring invite file")
+    pa_inv.add_argument("handle")
+    pa_inv.add_argument("--ttl", default="15m")
+    pa_inv.add_argument("--out", type=Path, default=None)
+    adm_sub.add_parser("pending", help="List pending join requests with device fingerprints")
+    pa_app = adm_sub.add_parser("approve", help="Approve a pending join request after fingerprint check")
+    pa_app.add_argument("handle")
+    pa_rej = adm_sub.add_parser("reject", help="Reject a pending join request")
+    pa_rej.add_argument("handle")
     adm_sub.add_parser("push", help="Push feed entries to all registered nodes")
     adm_sub.add_parser("status", help="Show epoch of all registered nodes")
     pa_rev = adm_sub.add_parser("revoke", help="Revoke a member or specific device")
@@ -132,17 +149,55 @@ def main(argv: list[str] | None = None) -> int:
             print(f"NODE OK: applied_epoch={node.applied_epoch()}")
             return 0
 
+    if args.command == "init":
+        pw = read_passphrase("Member keystore passphrase: ", confirm=True)
+        st = ClientManager().init_identity(args.handle, pw)
+        print(f"Initialised handle={st['handle']} device_id={st['device_id']} fingerprint={st['fingerprint']}")
+        return 0
+
+    if args.command == "identity":
+        st = ClientManager().get_identity()
+        print(f"handle={st['handle']} device_id={st['device_id']} key_version={st['key_version']} fingerprint={st['fingerprint']}")
+        return 0
+
+    if args.command == "join":
+        pw = read_passphrase("Member keystore passphrase: ")
+        res = ClientManager().join_invite(args.invite_file, pw)
+        print(f"Join request submitted: status={res.get('status')} device_fp={res.get('device_fp')}")
+        return 0
+
     if args.command == "admin":
         mgr = AdminManager()
         if args.admin_cmd == "init":
             pw = read_passphrase("Admin keystore passphrase: ", confirm=True)
-            res = mgr.init_group(args.group, pw)
+            res = mgr.init_group(args.group, pw, operator_handle=args.operator)
             print(f"Group created: {res['group_name']} feed_id={res['feed_id']} fingerprint={res['fingerprint']}")
             return 0
         if args.admin_cmd == "add-node":
             h, p = _parse_host_port(args.endpoint)
             res = mgr.add_node(h, p)
             print(f"Added node {res['node_id']} at {h}:{p}")
+            return 0
+        if args.admin_cmd == "invite":
+            pw = read_passphrase("Admin keystore passphrase: ")
+            out = args.out or Path(f"{args.handle}.invite")
+            inv = mgr.create_invite(args.handle, mgr.parse_ttl(args.ttl), out, pw)
+            print(f"Invite written to {out} (id={inv['invite_id']} admin_fp={inv['admin_fp']})")
+            return 0
+        if args.admin_cmd == "pending":
+            pw = read_passphrase("Admin keystore passphrase: ")
+            for item in mgr.pending_joins(pw):
+                print(f"handle={item['handle']} device_id={item['device_id']} fp={item['device_fp']} invite_id={item['invite_id']}")
+            return 0
+        if args.admin_cmd == "approve":
+            pw = read_passphrase("Admin keystore passphrase: ")
+            res = mgr.approve_join(args.handle, pw)
+            print(f"Approved {res['handle']} ({res['device_id']} fp={res['device_fp']})")
+            return 0
+        if args.admin_cmd == "reject":
+            pw = read_passphrase("Admin keystore passphrase: ")
+            res = mgr.reject_join(args.handle, pw)
+            print(f"Rejected {res['handle']}")
             return 0
         if args.admin_cmd == "push":
             for r in mgr.push_all():

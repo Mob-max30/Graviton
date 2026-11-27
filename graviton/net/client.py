@@ -9,7 +9,11 @@ from graviton.crypto.signatures import sign_message, verify_signature
 from graviton.feed.encoding import enc_u64
 from graviton.net.protocol import (
     DEFAULT_MAX_FRAME_BYTES,
+    JOIN_SIGN_DOMAIN,
     OP_FEED_PULL,
+    OP_INVITE_CREATE,
+    OP_JOIN_LIST,
+    OP_JOIN_RESOLVE,
     OP_STATUS,
     REQUEST_SIGN_DOMAIN,
     RESPONSE_SIGN_DOMAIN,
@@ -20,7 +24,9 @@ from graviton.net.protocol import (
     decode_hello,
     decode_response,
     encode_feed_push,
+    encode_join_request,
     encode_request,
+    join_signing_bytes,
     public_key_fingerprint_bytes,
     read_frame,
     request_signing_bytes,
@@ -160,4 +166,68 @@ class NodeClient:
         resp = self._verify_response(push_body, resp_body)
         if not resp.payload:
             raise NodeClientError(f"FEED_PUSH rejected (status={resp.status})")
+        return json.loads(resp.payload.decode("utf-8"))
+
+    def join_request(
+        self,
+        invite_id: str,
+        invite_secret: bytes,
+        handle: str,
+        device_id: str,
+        device_pk: bytes,
+        device_sk: bytes,
+    ) -> ResponseMessage:
+        if self._sock is None or self.hello is None:
+            raise NodeClientError("Not connected")
+        msg = join_signing_bytes(invite_id, invite_secret, handle, device_id, device_pk)
+        pop_sig = sign_message(device_sk, msg, domain=JOIN_SIGN_DOMAIN)
+        body = encode_join_request(invite_id, invite_secret, handle, device_id, device_pk, pop_sig)
+        write_frame(self._sock, body, max_frame_bytes=self.max_frame_bytes)
+        resp_body = read_frame(self._sock, max_frame_bytes=self.max_frame_bytes)
+        return self._verify_response(body, resp_body)
+
+    def create_invite(
+        self,
+        actor: str,
+        device_id: str,
+        key_version: int,
+        signing_sk: bytes,
+        invite_id: str,
+        secret_sha256: str,
+        handle_hint: str,
+        expires_at: int,
+    ) -> dict:
+        payload = json.dumps(
+            {
+                "invite_id": invite_id,
+                "secret_sha256": secret_sha256,
+                "handle_hint": handle_hint,
+                "expires_at": expires_at,
+            },
+            separators=(",", ":"),
+        ).encode("utf-8")
+        resp = self.send_request(actor, device_id, key_version, signing_sk, OP_INVITE_CREATE, payload)
+        if resp.status != 0:
+            raise NodeClientError(f"INVITE_CREATE denied (status={resp.status})")
+        return json.loads(resp.payload.decode("utf-8"))
+
+    def join_list(self, actor: str, device_id: str, key_version: int, signing_sk: bytes) -> list[dict]:
+        resp = self.send_request(actor, device_id, key_version, signing_sk, OP_JOIN_LIST, b"")
+        if resp.status != 0:
+            raise NodeClientError(f"JOIN_LIST denied (status={resp.status})")
+        return json.loads(resp.payload.decode("utf-8"))
+
+    def join_resolve(
+        self,
+        actor: str,
+        device_id: str,
+        key_version: int,
+        signing_sk: bytes,
+        invite_id: str,
+        status: str,
+    ) -> dict:
+        payload = json.dumps({"invite_id": invite_id, "status": status}, separators=(",", ":")).encode("utf-8")
+        resp = self.send_request(actor, device_id, key_version, signing_sk, OP_JOIN_RESOLVE, payload)
+        if resp.status != 0:
+            raise NodeClientError(f"JOIN_RESOLVE denied (status={resp.status})")
         return json.loads(resp.payload.decode("utf-8"))
