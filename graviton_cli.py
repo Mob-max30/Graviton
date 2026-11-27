@@ -503,6 +503,13 @@ def cmd_add(target_path: str) -> None:
             print(f"Synced folder '{p.name}' ({folder_id}): {added_cnt} added, {updated_cnt} updated in {org['name']} vault.")
 
 
+def _filter_accessible_items(rows: list[sqlite3.Row], user: sqlite3.Row | None) -> list[dict[str, Any]]:
+    if user is None or user["is_admin"]:
+        return [dict(r) for r in rows]
+    ident = user["identifier"]
+    return [dict(r) for r in rows if ident in json.loads(r["allowed_identifiers_json"])]
+
+
 def cmd_ls(folder_filter: str | None = None) -> None:
     if _get_server_url():
         org_id = _active_org_file().read_text(encoding="utf-8").strip() if _active_org_file().exists() else ""
@@ -513,13 +520,17 @@ def cmd_ls(folder_filter: str | None = None) -> None:
     else:
         with _connect() as conn:
             org = _get_active_org(conn)
-            if _is_admin_ip(conn, org):
+            is_admin = _is_admin_ip(conn, org)
+            cur_user = _current_user_for_org(conn, org)
+            if is_admin:
                 print(f"({org['name']})")
+            elif cur_user is not None:
+                print(f"({org['name']}:{cur_user['identifier']})")
             rows = conn.execute(
                 "SELECT * FROM resources WHERE org_id = ? ORDER BY created_at DESC",
                 (org["org_id"],),
             ).fetchall()
-        items = [dict(r) for r in rows]
+        items = [dict(r) for r in rows] if is_admin else _filter_accessible_items(rows, cur_user)
 
     if not items:
         print("No files or folders added yet.")
@@ -1196,7 +1207,8 @@ def _make_server_handler(db_path: Path | None = None):
                             "SELECT resource_id, name, kind, allowed_identifiers_json FROM resources WHERE org_id = ? ORDER BY created_at DESC",
                             (org["org_id"],),
                         ).fetchall()
-                        self._send_json(200, {"header": f"({org['name']})", "items": [dict(r) for r in rows]})
+                        items = _filter_accessible_items(rows, me)
+                        self._send_json(200, {"header": f"({org['name']})", "items": items})
                         return
                     if parsed.path == "/api/people":
                         me = self._resolve_user_by_ip(conn, org["org_id"], ip)
