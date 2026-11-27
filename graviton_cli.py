@@ -753,7 +753,8 @@ def _remote_chat() -> None:
                     if m["sender_user_id"] == me["user_id"]:
                         print(f"\r{GREEN}[{me['username']}]: {pt}{RESET}")
                     else:
-                        print(f"\r{WHITE}[{peer['username']}]: {pt}{RESET}")
+                        sys.stdout.write(f"\r{WHITE}[{peer['username']}]: {pt}{RESET}\n> ")
+                        sys.stdout.flush()
                     state["last_seen"] = max(state["last_seen"], float(m["created_at"]))
         except Exception:
             pass
@@ -862,111 +863,96 @@ def cmd_chat() -> None:
 
     peer = others[peer_idx]
 
-    me_kp = _load_keypair(me)
-    peer_kp = _load_keypair(peer)
-    pin_store = TrustedPeerStore()
-    pin_store.register_peer(me["user_id"], me_kp, CipherSuite.SUITE_HYBRID)
-    pin_store.register_peer(peer["user_id"], peer_kp, CipherSuite.SUITE_HYBRID)
+    with _connect() as conn:
+        session_id, pair_key = _get_or_create_pairwise_session(conn, org["org_id"], me["user_id"], peer["user_id"])
 
-    suite = CipherSuite.SUITE_HYBRID
-    initiator = HandshakeInitiator(me["user_id"], me["identifier"], me_kp, suite=suite, trusted_peers=pin_store)
-    responder = HandshakeResponder(peer["user_id"], peer["identifier"], peer_kp, trusted_peers=pin_store)
-    s_nonce, kem_ct, s_x_pk, s_sig, _ = responder.process_client_hello_and_reply(
-        client_id=initiator.identity,
-        client_role=initiator.role,
-        suite=suite,
-        client_nonce=initiator.client_nonce,
-        client_kem_pk=initiator.ephemeral_key.kem_pk,
-        client_x25519_pk=initiator.ephemeral_key.x25519_pk,
-    )
-    client_sig, me_keys = initiator.process_server_hello_and_authenticate(
-        server_id=peer["user_id"],
-        server_role=peer["identifier"],
-        server_identity_dsa_pk=peer_kp.dsa_pk,
-        server_identity_ed_pk=peer_kp.ed_pk,
-        server_nonce=s_nonce,
-        kem_ciphertext=kem_ct,
-        server_x25519_pk=s_x_pk,
-        server_signature=s_sig,
-    )
-    responder.complete_handshake(
-        client_identity_dsa_pk=me_kp.dsa_pk,
-        client_identity_ed_pk=me_kp.ed_pk,
-        client_signature=client_sig,
-    )
+    peer_fp = peer["fingerprint"]
+    print(f"\nEncrypted PQC chat started with {peer['username']} (real-time listening; type /quit to exit)\n")
+    state = {"last_seen": 0.0, "seq": 0}
+    print_lock = threading.Lock()
+    stop_event = threading.Event()
 
-    session_id = me_keys.session_id
+    def _poll() -> None:
+        try:
+            with _connect() as conn:
+                msgs = conn.execute(
+                    """
+                    SELECT * FROM chat_messages
+                    WHERE org_id = ?
+                      AND ((sender_user_id = ? AND recipient_user_id = ?)
+                        OR (sender_user_id = ? AND recipient_user_id = ?))
+                      AND created_at > ?
+                    ORDER BY created_at ASC
+                    """,
+                    (org["org_id"], me["user_id"], peer["user_id"], peer["user_id"], me["user_id"], state["last_seen"]),
+                ).fetchall()
+            with print_lock:
+                for m in msgs:
+                    if {m["sender_user_id"], m["recipient_user_id"]} != {me["user_id"], peer["user_id"]}:
+                        continue
+                    pt = ChaCha20Poly1305(pair_key).decrypt(
+                        bytes(m["nonce"]), bytes(m["ciphertext"]), bytes(m["aad"])
+                    ).decode("utf-8")
+                    if m["sender_user_id"] == me["user_id"]:
+                        print(f"\r{GREEN}[{me['username']}]: {pt}{RESET}")
+                    else:
+                        sys.stdout.write(f"\r{WHITE}[{peer['username']}]: {pt}{RESET}\n> ")
+                        sys.stdout.flush()
+                    state["last_seen"] = max(state["last_seen"], float(m["created_at"]))
+        except Exception:
+            pass
+
+    def _listener() -> None:
+        while not stop_event.is_set():
+            _poll()
+            stop_event.wait(0.4)
+
+    _poll()
+    listener_thread = threading.Thread(target=_listener, daemon=True)
+    listener_thread.start()
+
     logger = _audit_logger(org)
-    chat_key = bytes(org["vault_key"])
-    print(f"\nEncrypted PQC chat started with {peer['username']} (type /refresh to read, /quit to exit)\n")
+    try:
+        while True:
+            text = input("> ").strip()
+            if not text:
+                continue
+            if text == "/quit":
+                break
+            state["seq"] += 1
+            msg_id = f"msg_{uuid.uuid4().hex[:12]}"
+            nonce = secrets.token_bytes(12)
+            aad = AssociatedData(
+                protocol_version=1,
+                suite_id=int(CipherSuite.SUITE_HYBRID),
+                sender_id=me["user_id"],
+                recipient_id=peer["user_id"],
+                recipient_key_fingerprint=peer_fp,
+                recipient_epoch=1,
+                session_id=session_id,
+                sequence_number=state["seq"],
+                message_id=msg_id,
+                chunk_index=0,
+                chunk_count=1,
+                total_length=len(text.encode("utf-8")),
+            ).serialize()
 
-    def _print_history(since_ts: float) -> float:
-        with _connect() as conn:
-            msgs = conn.execute(
-                """
-                SELECT * FROM chat_messages
-                WHERE org_id = ?
-                  AND ((sender_user_id = ? AND recipient_user_id = ?)
-                    OR (sender_user_id = ? AND recipient_user_id = ?))
-                  AND created_at > ?
-                ORDER BY created_at ASC
-                """,
-                (org["org_id"], me["user_id"], peer["user_id"], peer["user_id"], me["user_id"], since_ts),
-            ).fetchall()
-        last_ts = since_ts
-        for m in msgs:
-            pt = ChaCha20Poly1305(chat_key).decrypt(bytes(m["nonce"]), bytes(m["ciphertext"]), bytes(m["aad"])).decode("utf-8")
-            if m["sender_user_id"] == me["user_id"]:
-                print(f"{GREEN}[{me['username']}]: {pt}{RESET}")
-            else:
-                print(f"{WHITE}[{peer['username']}]: {pt}{RESET}")
-            last_ts = max(last_ts, float(m["created_at"]))
-        return last_ts
-
-    last_seen = _print_history(0.0)
-    seq = 0
-    while True:
-        text = input("> ").strip()
-        if not text:
-            continue
-        if text == "/quit":
-            break
-        if text == "/refresh":
-            last_seen = _print_history(last_seen)
-            continue
-        seq += 1
-        msg_id = f"msg_{uuid.uuid4().hex[:12]}"
-        nonce = secrets.token_bytes(12)
-        aad = AssociatedData(
-            protocol_version=1,
-            suite_id=int(CipherSuite.SUITE_HYBRID),
-            sender_id=me["user_id"],
-            recipient_id=peer["user_id"],
-            recipient_key_fingerprint=peer["fingerprint"],
-            recipient_epoch=1,
-            session_id=session_id,
-            sequence_number=seq,
-            message_id=msg_id,
-            chunk_index=0,
-            chunk_count=1,
-            total_length=len(text.encode("utf-8")),
-        ).serialize()
-
-        ct = ChaCha20Poly1305(chat_key).encrypt(nonce, text.encode("utf-8"), aad)
-        now = time.time()
-        with _connect() as conn:
-            conn.execute(
-                """
-                INSERT INTO chat_messages (
-                    message_id, org_id, sender_user_id, recipient_user_id,
-                    session_id, seq_no, nonce, ciphertext, aad, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (msg_id, org["org_id"], me["user_id"], peer["user_id"], session_id, seq, nonce, ct, aad, now),
-            )
-            conn.commit()
-        last_seen = _print_history(last_seen)
-        logger.append_entry(me["user_id"], "CHAT_SEND", peer["user_id"], "allow")
+            ct = ChaCha20Poly1305(pair_key).encrypt(nonce, text.encode("utf-8"), aad)
+            with _connect() as conn:
+                conn.execute(
+                    """
+                    INSERT INTO chat_messages (
+                        message_id, org_id, sender_user_id, recipient_user_id,
+                        session_id, seq_no, nonce, ciphertext, aad, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (msg_id, org["org_id"], me["user_id"], peer["user_id"], session_id, state["seq"], nonce, ct, aad, time.time()),
+                )
+                conn.commit()
+            _poll()
+            logger.append_entry(me["user_id"], "CHAT_SEND", peer["user_id"], "allow")
+    finally:
+        stop_event.set()
 
 
 def cmd_people() -> None:
