@@ -1087,7 +1087,10 @@ def _make_server_handler(db_path: Path | None = None):
             self.wfile.write(body)
 
         def _client_ip(self) -> str:
-            return self.headers.get("X-Client-IP") or self.client_address[0]
+            # Only honor X-Client-IP from localhost (for local test harness); never trust remote spoofed headers
+            if self.client_address[0] in ("127.0.0.1", "::1"):
+                return self.headers.get("X-Client-IP") or self.client_address[0]
+            return self.client_address[0]
 
         def _read_json(self) -> dict[str, Any]:
             n = int(self.headers.get("Content-Length", "0"))
@@ -1140,6 +1143,10 @@ def _make_server_handler(db_path: Path | None = None):
                     self._send_json(404, {"error": "No organization"})
                     return
                 if parsed.path == "/api/ls":
+                    me = self._resolve_user_by_ip(conn, org["org_id"], ip)
+                    if not me:
+                        self._send_json(403, {"error": "Unauthorized"})
+                        return
                     rows = conn.execute(
                         "SELECT resource_id, name, kind, allowed_identifiers_json FROM resources WHERE org_id = ? ORDER BY created_at DESC",
                         (org["org_id"],),
@@ -1147,6 +1154,10 @@ def _make_server_handler(db_path: Path | None = None):
                     self._send_json(200, {"header": f"({org['name']})", "items": [dict(r) for r in rows]})
                     return
                 if parsed.path == "/api/people":
+                    me = self._resolve_user_by_ip(conn, org["org_id"], ip)
+                    if not me:
+                        self._send_json(403, {"error": "Unauthorized"})
+                        return
                     rows = conn.execute(
                         """
                         SELECT u.username, u.identifier, u.is_admin, d.device_ip, d.status
