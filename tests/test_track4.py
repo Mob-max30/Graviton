@@ -32,6 +32,12 @@ def test_gt_cli_integrated_with_trustledger(tmp_path: Path, monkeypatch, capsys)
     (sample_dir / "a.md").write_text("alpha", encoding="utf-8")
     assert graviton_cli.main(["-add", str(sample_dir)]) == 0
 
+    # Updating an existing folder adds new files and updates modified ones without duplicating
+    (sample_dir / "a.md").write_text("alpha-v2", encoding="utf-8")
+    (sample_dir / "b.md").write_text("beta", encoding="utf-8")
+    assert graviton_cli.main(["-add", str(sample_dir)]) == 0
+    assert "1 added, 1 updated" in capsys.readouterr().out
+
     assert graviton_cli.main(["ls"]) == 0
     ls_out = capsys.readouterr().out
     assert "(AcmeVault)" in ls_out

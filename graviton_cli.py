@@ -401,8 +401,12 @@ def _store_encrypted_resource(
     kind: str,
     content: bytes,
     allowed_identifiers: list[str],
-) -> str:
-    res_id = f"res_{uuid.uuid4().hex[:12]}"
+) -> tuple[str, bool]:
+    existing = conn.execute(
+        "SELECT resource_id FROM resources WHERE org_id = ? AND name = ? AND kind = ? LIMIT 1",
+        (org["org_id"], name, kind),
+    ).fetchone()
+    res_id = existing["resource_id"] if existing else f"res_{uuid.uuid4().hex[:12]}"
     nonce = secrets.token_bytes(12)
     aad = AssociatedData(
         protocol_version=1,
@@ -420,29 +424,35 @@ def _store_encrypted_resource(
     ).serialize()
     ct = ChaCha20Poly1305(bytes(org["vault_key"])).encrypt(nonce, content, aad)
 
-    conn.execute(
-        """
-        INSERT INTO resources (
-            resource_id, org_id, name, kind, owner_user_id,
-            allowed_identifiers_json, allowed_users_json, nonce, ciphertext, aad, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, '[]', ?, ?, ?, ?)
-        """,
-        (
-            res_id,
-            org["org_id"],
-            name,
-            kind,
-            org["admin_user_id"],
-            json.dumps(allowed_identifiers),
-            nonce,
-            ct,
-            aad,
-            time.time(),
-        ),
-    )
+    if existing:
+        conn.execute(
+            "UPDATE resources SET nonce = ?, ciphertext = ?, aad = ? WHERE resource_id = ?",
+            (nonce, ct, aad, res_id),
+        )
+    else:
+        conn.execute(
+            """
+            INSERT INTO resources (
+                resource_id, org_id, name, kind, owner_user_id,
+                allowed_identifiers_json, allowed_users_json, nonce, ciphertext, aad, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, '[]', ?, ?, ?, ?)
+            """,
+            (
+                res_id,
+                org["org_id"],
+                name,
+                kind,
+                org["admin_user_id"],
+                json.dumps(allowed_identifiers),
+                nonce,
+                ct,
+                aad,
+                time.time(),
+            ),
+        )
     enc_path = _org_vault_dir(org["name"], org["org_id"]) / f"{res_id}.enc"
     enc_path.write_bytes(nonce + ct)
-    return res_id
+    return res_id, bool(existing)
 
 
 def cmd_add(target_path: str) -> None:
@@ -455,21 +465,26 @@ def cmd_add(target_path: str) -> None:
 
         logger = _audit_logger(org)
         if p.is_file():
-            res_id = _store_encrypted_resource(conn, org, p.name, "file", p.read_bytes(), ["admin"])
+            res_id, updated = _store_encrypted_resource(conn, org, p.name, "file", p.read_bytes(), ["admin"])
             conn.commit()
-            logger.append_entry(org["admin_user_id"], "RESOURCE_ADD", res_id, "allow")
-            print(f"Added encrypted file: {p.name} ({res_id})")
+            logger.append_entry(org["admin_user_id"], "RESOURCE_UPDATE" if updated else "RESOURCE_ADD", res_id, "allow")
+            verb = "Updated" if updated else "Added"
+            print(f"{verb} encrypted file: {p.name} ({res_id})")
         elif p.is_dir():
-            folder_id = _store_encrypted_resource(conn, org, p.name, "folder", b"", ["admin"])
-            count = 0
+            folder_id, f_updated = _store_encrypted_resource(conn, org, p.name, "folder", b"", ["admin"])
+            added_cnt = 0
+            updated_cnt = 0
             for child in sorted(p.rglob("*")):
                 if child.is_file():
                     rel = f"{p.name}/{child.relative_to(p).as_posix()}"
-                    _store_encrypted_resource(conn, org, rel, "file", child.read_bytes(), ["admin"])
-                    count += 1
+                    _, was_upd = _store_encrypted_resource(conn, org, rel, "file", child.read_bytes(), ["admin"])
+                    if was_upd:
+                        updated_cnt += 1
+                    else:
+                        added_cnt += 1
             conn.commit()
-            logger.append_entry(org["admin_user_id"], "FOLDER_ADD", folder_id, "allow")
-            print(f"Added folder '{p.name}' ({folder_id}) with {count} encrypted file(s) into {org['name']} vault.")
+            logger.append_entry(org["admin_user_id"], "FOLDER_UPDATE" if f_updated else "FOLDER_ADD", folder_id, "allow")
+            print(f"Synced folder '{p.name}' ({folder_id}): {added_cnt} added, {updated_cnt} updated in {org['name']} vault.")
 
 
 def cmd_ls(folder_filter: str | None = None) -> None:
