@@ -1,39 +1,78 @@
-# Graviton — Post-Quantum Identity, E2EE & Explainable Detection
+# Graviton — Post-Quantum Identity, Encrypted Vault & E2EE Chat
 
-Track 4 prototype protecting organization files and messages using vetted post-quantum cryptography (`pqcrypto` ML-KEM-768 + ML-DSA-65) and hybrid X25519 + AES-256-GCM, paired with tamper-evident logging and a non-ML rule/graph detector.
+**Track 4: "Trust, but verify"** — Built on the `TrustLedger` post-quantum cryptographic backend (`ML-KEM-768`, `ML-DSA-65`, `X25519`, `Ed25519`, `ChaCha20-Poly1305`) with tamper-evident audit logging and explainable rule/graph detection (zero AI/ML).
 
-## Clean-Machine Setup & Terminal CLI
+---
 
-### Ubuntu / Linux (one command after clone)
+## Installation
+
+### Ubuntu / Linux (One-Command Setup)
 ```bash
+git clone https://github.com/Mob-max30/Graviton.git
+cd Graviton
 source setup.sh
 ```
+*(In a bare Ubuntu Docker container without `git`, run `DEBIAN_FRONTEND=noninteractive apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y git` first.)*
 
-### Manual / Windows
+### Windows / Manual Setup
 ```bash
+git clone https://github.com/Mob-max30/Graviton.git
+cd Graviton
 python -m pip install -r requirements.txt
 python -m pip install --no-deps -e .
 ```
 
-### Terminal Commands
+---
+
+## Usage (`gt` CLI)
+
+### 1. Register Organization & Start Server (Admin)
 ```bash
 gt -register <company-name>
-gt use <company-name>
-gt ls
+gt -serve &
+```
+* Registers the organization, creates its encrypted vault under `data/orgs/<company>_<id>/resources/`, and displays `(<company-name>)` in your bash prompt when on the admin IP.
+
+### 2. Add & List Encrypted Files / Folders
+```bash
 gt -add <file-or-folder-path>
+gt ls
+gt ls <folder-name>
+```
+* Encrypts and stores files under the company vault (`ChaCha20-Poly1305` + `AssociatedData` binding).
+* Re-running `gt -add` on an existing file or folder updates modified files and adds new ones in-place while preserving ACLs.
+
+### 3. Define Access & Add People
+```bash
 gt -add-people
+gt people
+```
+* Choose an existing access identifier (position) or select **Define new access** to name an identifier and assign which files/folders it can access.
+* Verifies the member's device IP is reachable and enrolls them as `<position> - <number>` (e.g., `finance - 1`, `finance - 2`).
+
+### 4. Connect User Devices & Switch Organizations
+On another container or machine:
+```bash
+gt -connect <admin-server-ip>
+gt orgs
+gt use <company-name>
+```
+
+### 5. Real-Time Pairwise E2EE Chat
+```bash
 gt -chat
 ```
+* Lists other members (excluding yourself) and establishes a dedicated pairwise `ML-KEM-768 + X25519` session.
+* Listens in real time for incoming messages (your messages appear in **green**, peer messages in **white**; type `/quit` to exit).
 
-## Run Verification Tests
+---
 
-```bash
-python -m pytest -v
-```
+## Automated Judging Adapter
+The root-level [track4_service.py](track4_service.py), [team_app.py](team_app.py), and [threat-model.json](threat-model.json) implement the `Track-4-Toolkit` `stdin`/`stdout` JSON contract (`setup`, `read`, `revoke`, `audit`, `protected_read`).
+
+---
 
 ## Security & Operational Policies
-
-- **Post-Quantum & Hybrid Cryptography:** `ML-DSA-65` for identity, authority, backup, and audit-log signatures; hybrid `ML-KEM-768 + X25519` with `HKDF-SHA256` for ephemeral forward-secret sessions; `AES-256-GCM` with strict AAD binding.
-- **Key Rotation & Grace Period:** Two-phase WAL rotation (`PREPARE` -> `COMMIT`). Every node rejects **new** requests using the old key immediately after `cutoff_at`. When `grace_seconds > 0`, only in-flight transfers started before `cutoff_at` may complete until `grace_until`.
-- **Clock Skew Support:** Detector supports out-of-order events within `±30.0` seconds (`supported_skew_range_sec = [-30.0, 30.0]`) and flags `uncertain_order = true` when consecutive events fall within the overlapping uncertainty window.
-- **Non-ML Detection:** Uses deterministic contextual rules, statistical thresholds, and `networkx` directed service graphs (no AI/ML components).
+* **Cryptography:** `ML-DSA-65` + `Ed25519` signatures, hybrid `ML-KEM-768 + X25519` ephemeral forward-secret handshakes, and `ChaCha20-Poly1305` AEAD with strict Associated Data binding.
+* **Key Rotation & Revocation:** Two-phase rotation with explicit cutoff & grace policy; revocations propagate across cluster nodes and persist across restarts/crash recovery.
+* **Audit & Detection:** Canonical JSON hash-chained + `ML-DSA-65`-signed logs with Merkle checkpoints; deterministic contextual rules, clock-skew handling, and graph-based lateral movement detection (no AI/ML).
