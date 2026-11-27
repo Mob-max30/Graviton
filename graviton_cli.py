@@ -1094,7 +1094,14 @@ def _make_server_handler(db_path: Path | None = None):
 
         def _read_json(self) -> dict[str, Any]:
             n = int(self.headers.get("Content-Length", "0"))
-            return json.loads(self.rfile.read(n).decode("utf-8")) if n > 0 else {}
+            if n < 0 or n > 1024 * 1024:
+                raise ValueError("Payload size out of bounds")
+            if n == 0:
+                return {}
+            obj = json.loads(self.rfile.read(n).decode("utf-8"))
+            if not isinstance(obj, dict):
+                raise ValueError("JSON body must be an object")
+            return obj
 
         def _resolve_org(self, conn: sqlite3.Connection, org_id: str) -> dict[str, Any] | None:
             if org_id:
@@ -1226,7 +1233,11 @@ def _make_server_handler(db_path: Path | None = None):
 
         def do_POST(self) -> None:
             parsed = urllib.parse.urlparse(self.path)
-            body = self._read_json()
+            try:
+                body = self._read_json()
+            except Exception:
+                self._send_json(400, {"error": "Invalid or oversized JSON payload"})
+                return
             ip = self._client_ip()
             with _connect(srv_db) as conn:
                 if parsed.path == "/api/use":
