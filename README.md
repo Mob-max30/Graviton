@@ -104,6 +104,7 @@ flowchart LR
 | [track4_service.py](file:///e:/My Projects/Graviton/track4_service.py) | Track 4 competition adapter for `Track-4-Toolkit/validate.py` |
 | [docs/ENGINE_DESIGN.md](file:///e:/My Projects/Graviton/docs/ENGINE_DESIGN.md) | Wire protocol byte layouts, SQLite schemas, limits, and crash recovery design |
 | [docs/DATA_MAP.md](file:///e:/My Projects/Graviton/docs/DATA_MAP.md) | Inventory of created files, keys, and attacker impact analysis |
+| [docs/THREAT_MODEL.md](file:///e:/My Projects/Graviton/docs/THREAT_MODEL.md) | Protected assets, threat actors, trust assumptions, and explicit limits |
 
 ## Installation and Environments
 
@@ -114,10 +115,12 @@ Core verification and the Track 4 adapter require only Python 3.12 and `pqcrypto
 ```powershell
 python -m venv .venv
 .venv\Scripts\python.exe -m pip install -r requirements.txt
+.venv\Scripts\python.exe -m pip install --no-deps .
 
 # Optional full environment with AES-256-GCM and scrypt keystores
 python -m venv .venv-app
 .venv-app\Scripts\python.exe -m pip install -r requirements.txt cryptography==50.0.2
+.venv-app\Scripts\python.exe -m pip install --no-deps .
 ```
 
 ### Linux
@@ -125,11 +128,15 @@ python -m venv .venv-app
 ```bash
 python3 -m venv .venv
 .venv/bin/python -m pip install -r requirements.txt
+.venv/bin/python -m pip install --no-deps .
 
 # Optional full environment with AES-256-GCM and scrypt keystores
 python3 -m venv .venv-app
 .venv-app/bin/python -m pip install -r requirements.txt cryptography==50.0.2
+.venv-app/bin/python -m pip install --no-deps .
 ```
+
+Run `graviton doctor` to verify Python, `pqcrypto`, AEAD, SQLite `RETURNING`, state directory permissions, and loopback ports. Run `graviton demo` in the full environment to execute the real multi node scenario end to end.
 
 ## CLI Quick Reference
 
@@ -154,6 +161,7 @@ Run commands via `python -m graviton <command>`:
 | `sentinel run \| alerts [--follow]` | Ops | Pull node audit logs, run live detection, and inspect alerts |
 | `audit verify` | Ops | Verify node audit hash chains and external head hashes |
 | `redteam SCENARIO --target HOST:PORT` | Test | Run loopback guarded attack checks against a live node |
+| `doctor \| demo` | Ops | Self check environment and run real multi node demo |
 | `detect-eval \| bench` | Eval | Run synthetic detection evaluation and benchmark suite |
 
 ## Verification and Measured Numbers
@@ -164,7 +172,7 @@ All tests and validation checks run against real subprocesses, real sockets, and
    ```bash
    python -m unittest discover -s tests -v
    ```
-   Verified 82 tests (6 skipped where `cryptography` or POSIX mode bits are required), 0 failures.
+   Verified 86 tests (9 skipped where `cryptography` or POSIX mode bits are required), 0 failures.
 2. **Track 4 Validator**:
    ```bash
    python ../Track-4-Toolkit/validate.py --entry "../Graviton/track4_service.py"
@@ -176,7 +184,20 @@ All tests and validation checks run against real subprocesses, real sockets, and
    - `tests/engine/test_stage3_membership.py`: invite, out of band fingerprint confirmation, lost device replacement, Mallory isolation, expired/wrong/forged rejections.
    - `tests/engine/test_stage4_data_plane.py`: E2EE messaging, chunked files, burn after reading (`DELETE ... RETURNING`), TTL purge, quotas, raw SQLite byte scan confirming no plaintext or keys, row tamper and reorder detection, cross user isolation, revoked denial on all nodes, and SQL injection inertness.
    - `tests/engine/test_stage5_sentinel_redteam.py`: benign admin workflow (0 alerts), all 9 live red team scenarios denied and alerted, `audit verify`, and `order_uncertain` clock skew handling.
-4. **Detection Evaluation Split (`detect-eval`)**:
+   - `tests/engine/test_stage6_packaging_demo.py`: `graviton doctor` checks and real multi node `graviton demo`.
+4. **Track 4 Checklist Metrics (Measured Locally)**:
+
+| Metric | Measured Value | Source |
+| --- | --- | --- |
+| Grace period (rotation cutoff) | `cutoff_offset=2` epochs (configurable) | `graviton admin rotate` |
+| Revocation time (in process bench) | `last_node_ms=94.0ms` | `python -m graviton bench` |
+| Revocation time (30 run real cluster probe) | `median=3195.0ms`, `p95=9235.0ms`, `max=9281.0ms` | `graviton probe revocation --runs 30` |
+| Timing range (clock skew / arrival delay) | `MAX_SKEW_MS=5000ms`, `MAX_DELAY_MS=10000ms` | `graviton/detect/clock.py` |
+| Detection F1 score | `F1=1.0` | `python -m graviton detect-eval` |
+| Median time to alert | `median_tta_ms=385.0ms` | `python -m graviton detect-eval` |
+| False alerts per 1,000 benign events | `false_alerts/1k=0.0` | `python -m graviton detect-eval` |
+
+5. **Detection Evaluation Split (`detect-eval`)**:
    Rules and thresholds in `graviton/detect/engine.py` were designed against the specification scenarios and evaluated on separately generated synthetic labelled logs in `graviton/detect/eval.py` (`generate_labelled_dataset`).
 
 ## What Is Real and What Is Not (Scope and Limitations)
