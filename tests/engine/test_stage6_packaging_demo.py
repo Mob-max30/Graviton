@@ -26,7 +26,12 @@ class Stage6PackagingAndDoctorTests(unittest.TestCase):
     def test_02_real_demo_runs_end_to_end(self) -> None:
         res = run_demo()
         self.assertTrue(res["audit_valid"])
-        self.assertEqual(len(res["revocation_ms"]), 2)
+        self.assertEqual(res["node_count"], 3)
+        self.assertTrue(res["rotation_old_rejected_all"])
+        self.assertTrue(res["rotation_new_accepted_all"])
+        self.assertTrue(res["neel_unaffected"])
+        self.assertTrue(res["backup_corrupt_detected"])
+        self.assertEqual(len(res["revocation_ms"]), 3)
         self.assertGreaterEqual(res["last_node_ms"], 0.0)
         self.assertEqual(len(res["redteam"]), 9)
         self.assertTrue(all(item["denied"] and item["node_alive"] for item in res["redteam"]))
