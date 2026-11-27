@@ -1424,6 +1424,146 @@ def cmd_prompt() -> None:
         conn.close()
 
 
+def _require_admin(conn: sqlite3.Connection, org: dict[str, Any], action: str, target: str) -> None:
+    if _get_server_url() or not _is_admin_ip(conn, org):
+        _audit_logger(org).append_event("non-admin", action, target, "deny")
+        print(f"Access denied: only the organization admin can {action.lower().replace('_', ' ')}.")
+        raise SystemExit(1)
+
+
+def cmd_del_user(target: str | None = None) -> None:
+    """Admin-only: delete a non-admin user and their devices/sessions."""
+    if _get_server_url():
+        print("Access denied: only the organization admin can delete users.")
+        raise SystemExit(1)
+    with _connect() as conn:
+        org = _get_active_org(conn)
+        _require_admin(conn, org, "USER_DELETE", target or "*")
+        users = conn.execute(
+            "SELECT user_id, username, identifier, is_admin FROM users WHERE org_id = ? AND is_admin = 0 ORDER BY created_at ASC",
+            (org["org_id"],),
+        ).fetchall()
+        if not users:
+            print("No non-admin users to delete.")
+            return
+        chosen: sqlite3.Row | None = None
+        if target:
+            t = target.strip().lower()
+            for u in users:
+                if u["user_id"].lower() == t or u["username"].lower() == t:
+                    chosen = u
+                    break
+        else:
+            print(f"\nUsers in {org['name']}:")
+            for idx, u in enumerate(users, start=1):
+                print(f"  {idx}. {u['username']} [{u['identifier']}] ({u['user_id']})")
+            sel = input("Delete user (number or username): ").strip()
+            if sel.isdigit() and 1 <= int(sel) <= len(users):
+                chosen = users[int(sel) - 1]
+            else:
+                for u in users:
+                    if u["username"].lower() == sel.lower() or u["user_id"].lower() == sel.lower():
+                        chosen = u
+                        break
+        if chosen is None:
+            print(f"User not found (or cannot delete admin): {target or ''}")
+            raise SystemExit(1)
+        uid = chosen["user_id"]
+        conn.execute("DELETE FROM pairwise_sessions WHERE org_id = ? AND (user_a = ? OR user_b = ?)", (org["org_id"], uid, uid))
+        conn.execute("DELETE FROM chat_messages WHERE org_id = ? AND (sender_user_id = ? OR recipient_user_id = ?)", (org["org_id"], uid, uid))
+        conn.execute("DELETE FROM users WHERE org_id = ? AND user_id = ? AND is_admin = 0", (org["org_id"], uid))
+        conn.commit()
+    _audit_logger(org).append_event(org["admin_user_id"], "USER_DELETE", uid, "allow")
+    print(f"Deleted user: {chosen['username']} ({uid})")
+
+
+def cmd_del_resource(target: str | None = None) -> None:
+    """Admin-only: delete an encrypted file or folder (and its children) from the vault."""
+    if _get_server_url():
+        print("Access denied: only the organization admin can delete resources.")
+        raise SystemExit(1)
+    with _connect() as conn:
+        org = _get_active_org(conn)
+        _require_admin(conn, org, "RESOURCE_DELETE", target or "*")
+        rows = conn.execute(
+            "SELECT resource_id, name, kind FROM resources WHERE org_id = ? ORDER BY created_at DESC",
+            (org["org_id"],),
+        ).fetchall()
+        if not rows:
+            print("No resources to delete.")
+            return
+        chosen: sqlite3.Row | None = None
+        if target:
+            t = target.strip().rstrip("/")
+            for r in rows:
+                if r["resource_id"] == t or r["name"] == t:
+                    chosen = r
+                    break
+        else:
+            print(f"\nResources in {org['name']}:")
+            for idx, r in enumerate(rows, start=1):
+                print(f"  {idx}. [{r['kind']}] {r['name']} ({r['resource_id']})")
+            sel = input("Delete resource (number or name): ").strip()
+            if sel.isdigit() and 1 <= int(sel) <= len(rows):
+                chosen = rows[int(sel) - 1]
+            else:
+                for r in rows:
+                    if r["name"] == sel or r["resource_id"] == sel:
+                        chosen = r
+                        break
+        if chosen is None:
+            print(f"Resource not found: {target or ''}")
+            raise SystemExit(1)
+
+        to_delete: list[sqlite3.Row] = [chosen]
+        if chosen["kind"] == "folder":
+            prefix = chosen["name"].rstrip("/") + "/"
+            to_delete.extend(r for r in rows if r["name"].startswith(prefix))
+
+        vault_dir = _org_vault_dir(org["name"], org["org_id"])
+        for r in to_delete:
+            conn.execute("DELETE FROM resources WHERE org_id = ? AND resource_id = ?", (org["org_id"], r["resource_id"]))
+            (vault_dir / f"{r['resource_id']}.enc").unlink(missing_ok=True)
+        conn.commit()
+    action = "FOLDER_DELETE" if chosen["kind"] == "folder" else "RESOURCE_DELETE"
+    _audit_logger(org).append_event(org["admin_user_id"], action, chosen["resource_id"], "allow")
+    print(f"Deleted {chosen['kind']}: {chosen['name']} ({len(to_delete)} item(s) removed)")
+
+
+def cmd_del_org(company_name: str | None = None) -> None:
+    """Admin-only: delete an organization, its vault, and all its members/resources."""
+    if _get_server_url():
+        print("Access denied: only the organization admin can delete an organization.")
+        raise SystemExit(1)
+    with _connect() as conn:
+        if company_name:
+            row = conn.execute(
+                "SELECT * FROM organizations WHERE LOWER(name) = LOWER(?) ORDER BY created_at DESC LIMIT 1",
+                (company_name.strip(),),
+            ).fetchone()
+            if not row:
+                print(f"Organization not found: {company_name}")
+                raise SystemExit(1)
+            org = dict(row)
+        else:
+            org = _get_active_org(conn)
+
+        _require_admin(conn, org, "ORG_DELETE", org["org_id"])
+        confirm = input(f"Type '{org['name']}' to confirm permanent deletion: ").strip()
+        if confirm != org["name"]:
+            print("Deletion cancelled.")
+            return
+        conn.execute("DELETE FROM organizations WHERE org_id = ?", (org["org_id"],))
+        conn.commit()
+
+    org_root = _org_vault_dir(org["name"], org["org_id"]).parent
+    shutil.rmtree(org_root, ignore_errors=True)
+    af = _active_org_file()
+    if af.exists() and af.read_text(encoding="utf-8").strip() == org["org_id"]:
+        af.unlink(missing_ok=True)
+    print(f"Deleted organization: {org['name']} ({org['org_id']})")
+
+
 def cmd_shell_init() -> None:
     print('_graviton_ps1() { local g; g=$(gt prompt 2>/dev/null); PS1="\\u@\\h:\\w${g}\\$ "; }')
     print('PROMPT_COMMAND="_graviton_ps1"')
@@ -1443,6 +1583,9 @@ def main(argv: list[str] | None = None) -> int:
         print("  gt -add <file-or-folder-path>")
         print("  gt -add-people")
         print("  gt -chat")
+        print("  gt -del <file-or-folder-name>")
+        print("  gt -del-user [username]")
+        print("  gt -del-org [company-name]")
         return 1
 
     flag = args[0]
@@ -1493,6 +1636,15 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if flag in ("-chat", "--chat"):
         cmd_chat()
+        return 0
+    if flag in ("-del", "--del", "-rm", "--rm", "-delete-resource", "--delete-resource"):
+        cmd_del_resource(args[1] if len(args) > 1 else None)
+        return 0
+    if flag in ("-del-user", "--del-user", "-rm-user", "--rm-user", "-delete-user", "--delete-user"):
+        cmd_del_user(args[1] if len(args) > 1 else None)
+        return 0
+    if flag in ("-del-org", "--del-org", "-rm-org", "--rm-org", "-delete-org", "--delete-org"):
+        cmd_del_org(args[1] if len(args) > 1 else None)
         return 0
 
     print(f"Unknown command: {flag}")
