@@ -14,6 +14,7 @@ from graviton.admin import AdminManager
 from graviton.client import ClientManager
 from graviton.comms.resumption import ResumptionError, ResumptionManager
 from graviton.comms.session import MessageError
+from graviton.crypto.aead import aead_available
 from graviton.crypto.keystore import load_keystore
 from graviton.daemon.node import init_node_daemon
 from graviton.net.client import NodeClient, NodeClientError
@@ -21,6 +22,7 @@ from graviton.net.protocol import format_fingerprint
 from tests.engine.helpers import DaemonProcess
 
 
+@unittest.skipUnless(aead_available(), "Stage 4 requires the 'app' extra (cryptography)")
 class Stage4DataPlaneTests(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = Path(tempfile.mkdtemp(prefix="graviton_stage4_"))
