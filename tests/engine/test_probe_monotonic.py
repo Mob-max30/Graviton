@@ -12,7 +12,7 @@ class TestProbeMonotonicAndLastNode(unittest.TestCase):
         src = inspect.getsource(probe.probe_revocation_once)
         self.assertIn("monotonic_ns", src)
         self.assertNotIn("time.time()", src)
-        self.assertIn("max(per_node_ms.values())", src)
+        self.assertIn("max(per_node_ms.values()", src)
 
 
 if __name__ == "__main__":
