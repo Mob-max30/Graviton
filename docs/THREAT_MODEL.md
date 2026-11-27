@@ -1,27 +1,26 @@
 # Graviton Threat Model
 
 ## 1. Protected Assets
-1. **Group Policy & Trust Root**: The admin `ML-DSA-65` public key, `feed_id`, and hash-chained policy entries (`REGISTER_KEY`, `ROTATE_KEY`, `REVOKE_DEVICE`, `REVOKE_ACTOR`) stored on every enforcement node.
-2. **Member & Admin Private Keys**: `ML-DSA-65` signing keys stored in `scrypt` + `AES-256-GCM` keystores (`admin.keystore.json`, `member.keystore.json`) and unlocked only in memory via runtime passphrase.
-3. **E2EE Message & File Confidentiality**: Plaintext messages and files encrypted end-to-end (`ML-KEM-768` + `HKDF-SHA256` + `AES-256-GCM`) before leaving the sender; node SQLite (`relay_vault.db`) stores only opaque ciphertext JSON.
-4. **Session Forward Secrecy**: Ephemeral `ML-KEM-768` secret keys (`eph_sk`) are deleted immediately upon `decapsulate()`, and session keys are stored only inside the member's `AES-256-GCM`-encrypted `sessions.enc.json`.
-5. **Audit Log Integrity**: Per-node SQLite `audit.db` protected by SHA-256 hash chaining, SQLite `UPDATE`/`DELETE` triggers, external head files, and signed checkpoints.
+1. **Policy Feed and Trust Root**: Admin `ML-DSA-65` public key, `feed_id`, and hash-chained policy entries (`REGISTER_KEY`, `ROTATE_KEY`, `REVOKE_DEVICE`, `REVOKE_ACTOR`) replicated across enforcement nodes.
+2. **Identity and Signing Keys**: `ML-DSA-65` keys stored in `scrypt` + `AES-256-GCM` keystores (`admin.keystore.json`, `member.keystore.json`) and unlocked only in memory via runtime passphrase.
+3. **E2EE Messages and File Chunks**: Plaintext messages and chunked files encrypted end-to-end (`ML-KEM-768` + `HKDF-SHA256` + `AES-256-GCM`) before leaving the sender; node SQLite (`relay_vault.db`) stores opaque ciphertext JSON only.
+4. **Audit Logs and Key Backups**: Hash-chained SQLite `audit.db` (with SQLite triggers and signed checkpoints), adapter `audit_log.jsonl` (hash-chained + `k_audit` HMAC), and `ML-DSA-65`-signed key backups.
+5. **Adapter State**: Track 4 adapter state (`owners`, `contents`, `disabled`, `revoked` tombstones) authenticated with `k_state` HMAC and anti-rollback `.head.json` in a separate `TRACK4_KEY_DIR`.
 
-## 2. Threat Actors & Capabilities
-- **Database Thief (`Mallory` with read/copy access to `relay_vault.db`)**: Can read or copy SQLite files from a node. Cannot recover plaintext, private keys, or session keys because none are stored on the node.
-- **Database Tamperer (`Mallory` with write access to `relay_vault.db`)**: Can modify, truncate, or reorder rows. Recipients detect tampering via `AES-256-GCM` tag and associated data `(recipient_id, sender_id, session_id, counter)` and discard incomplete or corrupt chunked transfers.
-- **Network Active Attacker**: Can replay captured `MSG_REQUEST` frames, tamper with wire bytes, send oversized frames, or forge `MSG_FEED_PUSH` entries. Denied by per-connection `server_nonce` + `seq`, `ML-DSA-65` signatures, pre-allocation frame bounds, and feed chain verification.
-- **Revoked or Compromised Member Device**: A lost or revoked device key is rejected independently by every node once the `REVOKE_*` feed entry propagates.
-- **Insider / Lateral Movement**: A valid member attempting `admin` operations or unexpected `relay -> vault -> admin` paths is denied at the node and alerted by Sentinel (`DetectionEngine`).
+## 2. Threat Actors
+- **Network Attacker**: Captures, replays, tampers with, or floods TCP frames or sends forged `FEED_PUSH` entries. Denied by per-connection nonces/sequences, `ML-DSA-65` signatures, pre-allocation frame limits, and feed chain verification.
+- **Malicious or Revoked Insider**: Uses a revoked key, probes another member's envelopes, or attempts privilege escalation / `relay -> vault -> admin` lateral movement. Denied by every node and alerted by Sentinel.
+- **Lost-Device Finder**: Possesses a stolen device keystore or key; once revoked, every node rejects it after feed convergence.
+- **Database Thief / Host-File Tamperer**: Copies or edits `relay_vault.db`, `adapter_state.json`, or `audit_log.jsonl`. `relay_vault.db` contains zero plaintext or keys; adapter state/log tampering or snapshot rollback triggers `integrity_violation`.
+- **Malicious Log Author**: Injects newlines, quotes, or fake JSON in `actor` or `request_id`; neutralized by canonical JSON escaping.
 
 ## 3. Trust Assumptions
-1. **Admin Key & Admin Machine**: The group admin `ML-DSA-65` key is a single point of failure, and the admin workstation is trusted.
-2. **Member Endpoints**: Sender and recipient devices are assumed uncompromised while unlocked.
-3. **Out-of-Band Fingerprint Verification**: Admin and member verify short SHA-256 fingerprints out-of-band before completing `join` and `approve`.
-4. **Adapter Trust Domain**: On the Track 4 competition adapter path (`track4_service.py`), admin key and node state share one host directory.
+- The group admin workstation and admin `ML-DSA-65` key are trusted (admin key is a single point of failure).
+- Sender and recipient endpoints are uncompromised while unlocked; OS CSPRNG (`secrets`) and `pqcrypto==0.4.0` are sound.
+- Admin and members verify short SHA-256 fingerprints out-of-band before `join` and `approve`.
 
-## 4. Explicit Limitations (Out of Scope in v1)
-- **Transport Metadata**: Plaintext TCP is used by default (optional classical `--tls-cert`/`--tls-key`); handles, sizes, and timing are visible to the network and nodes.
-- **Single-Hub Data Plane**: Policy feeds replicate across nodes, while `relay` and `vault` ciphertexts live on the target node only.
-- **Clock Synchronisation**: Nodes do not run a distributed clock protocol; Sentinel flags skew outside `MAX_SKEW_MS` (`5000ms`) as `order_uncertain`.
-- **Research Prototype**: Not independently audited; multi-machine operation across separate physical hosts was not tested.
+## 4. Honest Limitations
+- **Transport Metadata**: TCP traffic is plaintext unless optional classical TLS (`--tls-cert`/`--tls-key`) is enabled; handles, sizes, and timing are visible.
+- **Adapter Confidentiality**: Track 4 adapter `adapter_state.json` stores asset contents in plaintext (integrity-protected by `k_state` HMAC, not encrypted) because the adapter path is stdlib + `pqcrypto` only and refuses custom ciphers.
+- **Host Root**: A host-root attacker with read/write access to both `TRACK4_STATE_DIR` and `TRACK4_KEY_DIR` can forge MACs.
+- **Architecture Scope**: Single-hub `relay`/`vault` data plane in v1; local loopback clusters only (multi-machine not tested); Python code is not guaranteed constant-time; not independently audited.
