@@ -52,8 +52,8 @@ NODE_IDENTITY_FILENAME = "node_identity.json"
 DEFAULT_MAX_CONNECTIONS = 64
 DEFAULT_READ_TIMEOUT_S = 5.0
 DEFAULT_IDLE_TIMEOUT_S = 30.0
-DEFAULT_SOURCE_RATE = (60, 10.0)   # 60 requests per 10s per source IP
-DEFAULT_IDENTITY_RATE = (120, 10.0)  # 120 requests per 10s per identity
+DEFAULT_SOURCE_RATE = (600, 10.0)    # 600 requests per 10s per source IP
+DEFAULT_IDENTITY_RATE = (600, 10.0)  # 600 requests per 10s per identity
 
 
 class _RateLimiter:
@@ -125,6 +125,8 @@ class NodeDaemon:
         tls_cert: str | None = None,
         tls_key: str | None = None,
         ready_file: str | Path | None = None,
+        upstream: tuple[str, int] | None = None,
+        sync_interval_s: float = 1.0,
     ) -> None:
         self.node_dir = Path(node_dir)
         self.host = host
@@ -135,6 +137,8 @@ class NodeDaemon:
         self.max_connections = max_connections
         self.operators = set(operators or set())
         self.ready_file = Path(ready_file) if ready_file else None
+        self.upstream = upstream
+        self.sync_interval_s = sync_interval_s
 
         if host not in ("127.0.0.1", "::1", "localhost"):
             print(
@@ -409,9 +413,30 @@ class NodeDaemon:
             )
         return bound_host, bound_port
 
+    def _upstream_sync_loop(self) -> None:
+        from graviton.net.client import NodeClient
+
+        assert self.upstream is not None
+        u_host, u_port = self.upstream
+        while not self._stop_event.is_set():
+            try:
+                since = self.node.applied_epoch()
+                with NodeClient(u_host, u_port, timeout=self.read_timeout_s) as cli:
+                    entries = cli.feed_pull(
+                        self.node_id, self.node_id, 1, self._node_sk, since_epoch=since
+                    )
+                for raw in entries:
+                    self.node.apply_entry(raw)
+            except Exception:
+                pass
+            self._stop_event.wait(self.sync_interval_s)
+
     def serve_forever(self) -> None:
         if self._srv_sock is None:
             self.start()
+        if self.upstream is not None:
+            sync_t = threading.Thread(target=self._upstream_sync_loop, daemon=True)
+            sync_t.start()
         assert self._srv_sock is not None
         while not self._stop_event.is_set():
             try:
@@ -439,6 +464,10 @@ class NodeDaemon:
 
 
 def run_node_cli(args) -> int:
+    upstream = None
+    if getattr(args, "upstream", None):
+        uh, up = args.upstream.rsplit(":", 1)
+        upstream = (uh, int(up))
     daemon = NodeDaemon(
         args.dir,
         host=args.host,
@@ -451,6 +480,8 @@ def run_node_cli(args) -> int:
         tls_cert=args.tls_cert,
         tls_key=args.tls_key,
         ready_file=args.ready_file,
+        upstream=upstream,
+        sync_interval_s=getattr(args, "sync_interval", 1.0),
     )
 
     def _shutdown(_signum, _frame) -> None:

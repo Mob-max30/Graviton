@@ -158,4 +158,6 @@ class NodeClient:
         write_frame(self._sock, push_body, max_frame_bytes=self.max_frame_bytes)
         resp_body = read_frame(self._sock, max_frame_bytes=self.max_frame_bytes)
         resp = self._verify_response(push_body, resp_body)
+        if not resp.payload:
+            raise NodeClientError(f"FEED_PUSH rejected (status={resp.status})")
         return json.loads(resp.payload.decode("utf-8"))

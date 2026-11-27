@@ -6,13 +6,17 @@ import base64
 from pathlib import Path
 import sys
 
+from graviton.admin import AdminManager, read_passphrase
 from graviton.audit import AuditLog
 from graviton.bench.suite import run_benchmarks
+from graviton.cluster import cluster_down, cluster_status, cluster_up
+from graviton.crypto.keystore import load_keystore
 from graviton.daemon.node import init_node_daemon, run_node_cli
 from graviton.detect import evaluate_detection
 from graviton.lifecycle import BackupVerificationError, verify_and_load_backup
 from graviton.net.protocol import DEFAULT_MAX_FRAME_BYTES
 from graviton.nodes import Node
+from graviton.probe import run_revocation_probe
 
 
 def _parse_host_port(spec: str) -> tuple[str, int]:
@@ -43,9 +47,48 @@ def main(argv: list[str] | None = None) -> int:
     pn_run.add_argument("--tls-cert", default=None)
     pn_run.add_argument("--tls-key", default=None)
     pn_run.add_argument("--ready-file", type=Path, default=None)
+    pn_run.add_argument("--upstream", default=None, help="Upstream HOST:PORT for policy polling")
+    pn_run.add_argument("--sync-interval", type=float, default=1.0)
 
     pn_stat = node_sub.add_parser("status", help="Inspect local node state")
     pn_stat.add_argument("--dir", required=True, type=Path)
+
+    p_adm = sub.add_parser("admin", help="Group admin commands (uses scrypt keystore)")
+    adm_sub = p_adm.add_subparsers(dest="admin_cmd", required=True)
+    pa_init = adm_sub.add_parser("init", help="Create a new group and admin keystore")
+    pa_init.add_argument("--group", required=True)
+    pa_add = adm_sub.add_parser("add-node", help="Register a node HOST:PORT and push feed")
+    pa_add.add_argument("endpoint")
+    adm_sub.add_parser("push", help="Push feed entries to all registered nodes")
+    adm_sub.add_parser("status", help="Show epoch of all registered nodes")
+    pa_rev = adm_sub.add_parser("revoke", help="Revoke a member or specific device")
+    pa_rev.add_argument("handle")
+    pa_rev.add_argument("--device", default=None)
+    pa_rot = adm_sub.add_parser("rotate", help="Rotate a member device key")
+    pa_rot.add_argument("handle")
+    pa_rot.add_argument("--device", required=True)
+    pa_rot.add_argument("--version", type=int, required=True)
+    pa_rot.add_argument("--new-pubkey-b64", required=True)
+    pa_rot.add_argument("--cutoff-offset", type=int, default=2)
+
+    p_cls = sub.add_parser("cluster", help="Manage local multi-process node cluster")
+    cls_sub = p_cls.add_subparsers(dest="cluster_cmd", required=True)
+    pc_up = cls_sub.add_parser("up", help="Start N real node processes")
+    pc_up.add_argument("--nodes", type=int, default=3)
+    pc_up.add_argument("--dir", required=True, type=Path)
+    pc_up.add_argument("--sync-interval", type=float, default=0.2)
+    pc_stat = cls_sub.add_parser("status", help="Show cluster node status")
+    pc_stat.add_argument("--dir", required=True, type=Path)
+    pc_down = cls_sub.add_parser("down", help="Stop cluster node processes")
+    pc_down.add_argument("--dir", required=True, type=Path)
+
+    p_prb = sub.add_parser("probe", help="External measurement probes against running nodes")
+    prb_sub = p_prb.add_subparsers(dest="probe_cmd", required=True)
+    pp_rev = prb_sub.add_parser("revocation", help="Measure external revocation propagation")
+    pp_rev.add_argument("--cluster-dir", required=True, type=Path)
+    pp_rev.add_argument("--runs", type=int, default=30)
+    pp_rev.add_argument("--poll-interval", type=float, default=0.01)
+    pp_rev.add_argument("--out", type=Path, default=None)
 
     p_init = sub.add_parser("node-init", help="Initialise an enforcement node directory")
     p_init.add_argument("--dir", required=True, type=Path)
@@ -88,6 +131,77 @@ def main(argv: list[str] | None = None) -> int:
                 return 1
             print(f"NODE OK: applied_epoch={node.applied_epoch()}")
             return 0
+
+    if args.command == "admin":
+        mgr = AdminManager()
+        if args.admin_cmd == "init":
+            pw = read_passphrase("Admin keystore passphrase: ", confirm=True)
+            res = mgr.init_group(args.group, pw)
+            print(f"Group created: {res['group_name']} feed_id={res['feed_id']} fingerprint={res['fingerprint']}")
+            return 0
+        if args.admin_cmd == "add-node":
+            h, p = _parse_host_port(args.endpoint)
+            res = mgr.add_node(h, p)
+            print(f"Added node {res['node_id']} at {h}:{p}")
+            return 0
+        if args.admin_cmd == "push":
+            for r in mgr.push_all():
+                print(f"{r['node_id']} ({r['host']}:{r['port']}): applied={r.get('applied')}")
+            return 0
+        if args.admin_cmd == "status":
+            for s in mgr.status_all():
+                print(f"{s['node_id']} ({s['host']}:{s['port']}): epoch={s['epoch']}")
+            return 0
+        if args.admin_cmd == "revoke":
+            pw = read_passphrase("Admin keystore passphrase: ")
+            mgr.revoke(args.handle, pw, device_id=args.device)
+            print(f"Revoked {args.handle}" + (f" device={args.device}" if args.device else ""))
+            return 0
+        if args.admin_cmd == "rotate":
+            pw = read_passphrase("Admin keystore passphrase: ")
+            new_pk = base64.b64decode(args.new_pubkey_b64, validate=True)
+            mgr.rotate(args.handle, args.device, args.version, new_pk, args.cutoff_offset, pw)
+            print(f"Rotated {args.handle}/{args.device} to v{args.version}")
+            return 0
+
+    if args.command == "cluster":
+        if args.cluster_cmd == "up":
+            mgr = AdminManager()
+            st = mgr._load_state()
+            apk = base64.b64decode(st["admin_pk_b64"], validate=True)
+            entries = [bytes.fromhex(h) for h in st["entries_hex"]]
+            cinfo = cluster_up(args.dir, args.nodes, st["feed_id"], apk, sync_interval_s=args.sync_interval, initial_entries=entries)
+            for n in cinfo["nodes"]:
+                print(f"Started {n['node_id']} pid={n['pid']} at {n['host']}:{n['port']}")
+            return 0
+        if args.cluster_cmd == "status":
+            for s in cluster_status(args.dir):
+                print(f"{s['node_id']} pid={s['pid']} {s['host']}:{s['port']} alive={s['alive']} epoch={s['epoch']}")
+            return 0
+        if args.cluster_cmd == "down":
+            cnt = cluster_down(args.dir)
+            print(f"Stopped {cnt} cluster nodes")
+            return 0
+
+    if args.command == "probe" and args.probe_cmd == "revocation":
+        import json as _json
+
+        mgr = AdminManager()
+        pw = read_passphrase("Admin keystore passphrase: ")
+        _, _, admin_sk = load_keystore(mgr.keystore_path, pw)
+        cinfo = _json.loads((args.cluster_dir / "cluster.json").read_text(encoding="utf-8"))
+        res = run_revocation_probe(
+            cinfo, admin_sk, runs=args.runs, poll_interval_s=args.poll_interval
+        )
+        print(
+            f"Revocation Probe | runs={res['runs']} nodes={res['node_count']} "
+            f"sync_interval={res['sync_interval_s']}s poll_interval={res['probe_poll_interval_s']}s | "
+            f"last_node median={res['last_node_median_ms']}ms p95={res['last_node_p95_ms']}ms "
+            f"max={res['last_node_max_ms']}ms"
+        )
+        if args.out is not None:
+            args.out.write_text(_json.dumps(res, indent=2), encoding="utf-8")
+        return 0
 
     if args.command == "node-init":
         pk = base64.b64decode(args.admin_pubkey_b64, validate=True)
