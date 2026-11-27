@@ -4,7 +4,7 @@ Graviton is a post quantum security engine for zero trust groups, tamper evident
 
 ## What This Project Does
 
-Graviton separates **identity and policy** from **message storage**:
+Graviton separates **identity and policy** from **message storage** :
 
 1. **Group Policy and Revocation**: A group administrator (such as Kavya) creates a signed, hash chained policy feed using `ML-DSA-65` (`pqcrypto==0.4.0`). Every enforcement node verifies and applies this feed locally. When a member or device is revoked or rotated, every node independently stops accepting that key.
 2. **Untrusted Storage Protection**: Nodes store only opaque encrypted envelopes and encrypted file chunks inside SQLite (`relay_vault.db`). Plaintext messages, private keys, and session keys never touch the node database.
