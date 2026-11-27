@@ -150,11 +150,27 @@ def _org_vault_dir(org_name: str, org_id: str) -> Path:
 
 def _audit_logger(org: dict[str, Any]) -> SignedAuditLogger:
     log_path = _org_vault_dir(org["name"], org["org_id"]).parent / "audit.log"
-    return SignedAuditLogger(
+    logger = SignedAuditLogger(
         log_path=log_path,
         signer_key_id=org["org_id"],
         signer_sk=bytes(org["audit_sign_sk"]),
     )
+    if log_path.exists():
+        for raw_line in log_path.read_text(encoding="utf-8").splitlines():
+            line = raw_line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if obj.get("type") == "checkpoint":
+                logger._current_leaf_hashes = []
+            elif "seq" in obj and "entry_hash" in obj:
+                logger.last_seq = int(obj["seq"])
+                logger.last_hash = str(obj["entry_hash"])
+                logger._current_leaf_hashes.append(logger.last_hash)
+    return logger
 
 
 def _active_org_file() -> Path:
