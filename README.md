@@ -2,8 +2,6 @@
 
 Graviton is a post quantum security engine for zero trust groups, tamper evident audit logging, and end to end encrypted messaging over untrusted storage.
 
-UX inspired by the author's earlier project Pandora's Veil; no code reused.
-
 ## What This Project Does
 
 Graviton separates **identity and policy** from **message storage**:
