@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import base64
+from concurrent.futures import ThreadPoolExecutor
+import hashlib
 import math
 import statistics
 import time
@@ -19,6 +21,49 @@ def _percentile(sorted_vals: list[float], pct: float) -> float:
     return sorted_vals[idx]
 
 
+def _push_entries(node: dict, entries: list[bytes]) -> None:
+    """Push signed feed entries to a node and require every entry to be applied."""
+    if not entries:
+        return
+    pk = base64.b64decode(node["node_pk_b64"])
+    with NodeClient(node["host"], int(node["port"]), expected_node_pk=pk, timeout=5.0) as cli:
+        result = cli.feed_push(entries)
+    if result.get("applied", 0) != len(entries):
+        raise RuntimeError(f"Feed push failed on {node['node_id']}: {result}")
+
+
+def _push_entry(node: dict, raw_entry: bytes) -> None:
+    _push_entries(node, [raw_entry])
+
+
+def _fan_out(nodes: list[dict], entries: list[bytes]) -> None:
+    """Apply entries to all independent nodes in parallel; surface any failure."""
+    with ThreadPoolExecutor(max_workers=len(nodes)) as pool:
+        futures = [pool.submit(_push_entries, node, entries) for node in nodes]
+        for future in futures:
+            future.result()
+
+
+def _catch_up_nodes(nodes: list[dict], source_entries: list[bytes]) -> None:
+    """Catch nodes up from their HELLO epoch using the authoritative signed feed."""
+    def catch_up(node: dict) -> None:
+        pk = base64.b64decode(node["node_pk_b64"])
+        with NodeClient(node["host"], int(node["port"]), expected_node_pk=pk, timeout=5.0) as cli:
+            assert cli.hello is not None
+            current_epoch = cli.hello.node_epoch
+        if current_epoch > len(source_entries):
+            raise RuntimeError(
+                f"Node {node['node_id']} is ahead of the authoritative feed "
+                f"({current_epoch} > {len(source_entries)})"
+            )
+        _push_entries(node, source_entries[current_epoch:])
+
+    with ThreadPoolExecutor(max_workers=len(nodes)) as pool:
+        futures = [pool.submit(catch_up, node) for node in nodes]
+        for future in futures:
+            future.result()
+
+
 def probe_revocation_once(
     nodes: list[dict],
     author: FeedAuthor,
@@ -29,8 +74,11 @@ def probe_revocation_once(
     poll_interval_s: float = 0.05,
     timeout_s: float = 15.0,
 ) -> dict:
-    """Measure external time from admin revoke push until LAST node refuses."""
-    # 1. Confirm member is allowed on every node before revocation
+    """Measure revocation fan-out time until every node denies the identity."""
+    if not nodes:
+        raise ValueError("At least one node is required")
+
+    # Confirm the target is active everywhere before the measurement.
     deadline_pre = time.monotonic() + timeout_s
     for n in nodes:
         pk = base64.b64decode(n["node_pk_b64"])
@@ -46,23 +94,17 @@ def probe_revocation_once(
                 raise TimeoutError(f"Pre-revocation allow timed out on {n['node_id']}")
             time.sleep(poll_interval_s)
 
-    # 2. Record t0 immediately before pushing REVOKE_ACTOR to hub (node 0)
     rev_entry = author.revoke_actor(handle)
-    hub = nodes[0]
-    hub_pk = base64.b64decode(hub["node_pk_b64"])
     t0 = time.monotonic_ns()
-    with NodeClient(hub["host"], int(hub["port"]), expected_node_pk=hub_pk, timeout=5.0) as cli:
-        push_res = cli.feed_push([rev_entry])
-        if push_res.get("applied", 0) < 1:
-            raise RuntimeError(f"Revoke push failed on hub: {push_res}")
+    _fan_out(nodes, [rev_entry])
 
-    # 3. Poll every node with real signed requests until each refuses
+    # Verify each live node refuses the same signed member request.
     per_node_ms: dict[str, float] = {}
     remaining = list(nodes)
     deadline = time.monotonic() + timeout_s
     while remaining:
         if time.monotonic() > deadline:
-            raise TimeoutError(f"Revocation propagation timed out for {[n['node_id'] for n in remaining]}")
+            raise TimeoutError(f"Revocation enforcement timed out for {[n['node_id'] for n in remaining]}")
         still_allowing = []
         for n in remaining:
             pk = base64.b64decode(n["node_pk_b64"])
@@ -79,11 +121,7 @@ def probe_revocation_once(
         if remaining:
             time.sleep(poll_interval_s)
 
-    last_ms = max(per_node_ms.values()) if per_node_ms else 0.0
-    return {
-        "per_node_ms": per_node_ms,
-        "last_node_ms": last_ms,
-    }
+    return {"per_node_ms": per_node_ms, "last_node_ms": max(per_node_ms.values(), default=0.0)}
 
 
 def run_revocation_probe(
@@ -95,25 +133,27 @@ def run_revocation_probe(
 ) -> dict:
     """Run N external revocation propagation trials against a running cluster."""
     nodes = cluster_info["nodes"]
+    if not nodes:
+        raise ValueError("cluster_info must contain at least one node")
+
     hub = nodes[0]
     hub_pk = base64.b64decode(hub["node_pk_b64"])
-
     with NodeClient(hub["host"], int(hub["port"]), expected_node_pk=hub_pk) as cli:
         assert cli.hello is not None
         feed_id = cli.hello.feed_id
         epoch = cli.hello.node_epoch
 
-    # Sync FeedAuthor with hub's current head
-    author = FeedAuthor(feed_id, admin_secret_key)
-    if epoch > 0:
-        # Retrieve last entry hash from hub's node_state via a status/author or pass it in
-        from graviton.nodes import Node
-        import hashlib
+    # Synchronize FeedAuthor and the replicas with the authoritative hub feed.
+    from graviton.nodes import Node
 
-        hub_node = Node(hub["dir"])
-        entries = hub_node.entries_after(0)
-        author.epoch = len(entries)
-        author.last_hash = hashlib.sha256(entries[-1]).digest()
+    hub_entries = Node(hub["dir"]).entries_after(0)
+    if len(hub_entries) != epoch:
+        raise RuntimeError(f"Hub feed is inconsistent: HELLO epoch={epoch}, entries={len(hub_entries)}")
+    author = FeedAuthor(feed_id, admin_secret_key)
+    if hub_entries:
+        author.epoch = len(hub_entries)
+        author.last_hash = hashlib.sha256(hub_entries[-1]).digest()
+    _catch_up_nodes(nodes, hub_entries)
 
     last_node_samples: list[float] = []
     for i in range(runs):
@@ -121,9 +161,10 @@ def run_revocation_probe(
         dev_id = f"probe-dev-{i}"
         dev_pk, dev_sk = generate_signing_keypair()
         reg = author.register_key(handle, dev_id, dev_pk)
-        with NodeClient(hub["host"], int(hub["port"]), expected_node_pk=hub_pk) as cli:
-            cli.feed_push([reg])
 
+        # Register on every node first; the probe's before-state must be allow
+        # everywhere rather than waiting on an unregistered replica to sync.
+        _fan_out(nodes, [reg])
         res = probe_revocation_once(
             nodes, author, handle, dev_id, dev_sk, poll_interval_s=poll_interval_s
         )
