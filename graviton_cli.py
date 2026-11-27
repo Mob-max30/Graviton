@@ -731,6 +731,7 @@ def _remote_chat() -> None:
 
     print(f"\nEncrypted PQC chat started with {peer['username']} (real-time listening; type /quit to exit)\n")
     state = {"last_seen": 0.0, "seq": 0}
+    seen_ids: set[str] = set()
     print_lock = threading.Lock()
     stop_event = threading.Event()
 
@@ -740,24 +741,30 @@ def _remote_chat() -> None:
                 "GET",
                 f"/api/chat/messages?org_id={urllib.parse.quote(info['org_id'])}&peer_id={urllib.parse.quote(peer['user_id'])}&since={state['last_seen']}",
             )
-            with print_lock:
-                for m in msgs:
-                    # Strictly verify sender/recipient belong ONLY to this (me <-> peer) pair
-                    if {m["sender_user_id"], m["recipient_user_id"]} != {me["user_id"], peer["user_id"]}:
-                        continue
+        except Exception:
+            return
+        with print_lock:
+            for m in msgs:
+                mid = m.get("message_id", "")
+                state["last_seen"] = max(state["last_seen"], float(m["created_at"]))
+                if mid in seen_ids:
+                    continue
+                seen_ids.add(mid)
+                if {m["sender_user_id"], m["recipient_user_id"]} != {me["user_id"], peer["user_id"]}:
+                    continue
+                try:
                     pt = ChaCha20Poly1305(pair_key).decrypt(
                         base64.b64decode(m["nonce_b64"]),
                         base64.b64decode(m["ct_b64"]),
                         base64.b64decode(m["aad_b64"]),
                     ).decode("utf-8")
-                    if m["sender_user_id"] == me["user_id"]:
-                        print(f"\r{GREEN}[{me['username']}]: {pt}{RESET}")
-                    else:
-                        sys.stdout.write(f"\r{WHITE}[{peer['username']}]: {pt}{RESET}\n> ")
-                        sys.stdout.flush()
-                    state["last_seen"] = max(state["last_seen"], float(m["created_at"]))
-        except Exception:
-            pass
+                except Exception:
+                    continue
+                if m["sender_user_id"] == me["user_id"]:
+                    print(f"\r{GREEN}[{me['username']}]: {pt}{RESET}")
+                else:
+                    sys.stdout.write(f"\r{WHITE}[{peer['username']}]: {pt}{RESET}\n> ")
+                    sys.stdout.flush()
 
     def _listener() -> None:
         while not stop_event.is_set():
@@ -869,6 +876,7 @@ def cmd_chat() -> None:
     peer_fp = peer["fingerprint"]
     print(f"\nEncrypted PQC chat started with {peer['username']} (real-time listening; type /quit to exit)\n")
     state = {"last_seen": 0.0, "seq": 0}
+    seen_ids: set[str] = set()
     print_lock = threading.Lock()
     stop_event = threading.Event()
 
@@ -886,21 +894,28 @@ def cmd_chat() -> None:
                     """,
                     (org["org_id"], me["user_id"], peer["user_id"], peer["user_id"], me["user_id"], state["last_seen"]),
                 ).fetchall()
-            with print_lock:
-                for m in msgs:
-                    if {m["sender_user_id"], m["recipient_user_id"]} != {me["user_id"], peer["user_id"]}:
-                        continue
+        except Exception:
+            return
+        with print_lock:
+            for m in msgs:
+                mid = m["message_id"]
+                state["last_seen"] = max(state["last_seen"], float(m["created_at"]))
+                if mid in seen_ids:
+                    continue
+                seen_ids.add(mid)
+                if {m["sender_user_id"], m["recipient_user_id"]} != {me["user_id"], peer["user_id"]}:
+                    continue
+                try:
                     pt = ChaCha20Poly1305(pair_key).decrypt(
                         bytes(m["nonce"]), bytes(m["ciphertext"]), bytes(m["aad"])
                     ).decode("utf-8")
-                    if m["sender_user_id"] == me["user_id"]:
-                        print(f"\r{GREEN}[{me['username']}]: {pt}{RESET}")
-                    else:
-                        sys.stdout.write(f"\r{WHITE}[{peer['username']}]: {pt}{RESET}\n> ")
-                        sys.stdout.flush()
-                    state["last_seen"] = max(state["last_seen"], float(m["created_at"]))
-        except Exception:
-            pass
+                except Exception:
+                    continue
+                if m["sender_user_id"] == me["user_id"]:
+                    print(f"\r{GREEN}[{me['username']}]: {pt}{RESET}")
+                else:
+                    sys.stdout.write(f"\r{WHITE}[{peer['username']}]: {pt}{RESET}\n> ")
+                    sys.stdout.flush()
 
     def _listener() -> None:
         while not stop_event.is_set():
